@@ -40,10 +40,9 @@ cd local && docker compose up --build
 
 1. GCP PubSub delivers a message to `POST /` (`app/main.py`)
 2. `app/services/action_runner.py::execute_action()` resolves the integration from Gundi, looks up the handler by `action_id`, and invokes it
-3. Action handlers live in `app/actions/handlers.py` — three are registered:
+3. Action handlers live in `app/actions/handlers.py` — two are registered:
    - `action_auth` — validates SOAP creds by calling `getAllAssets`
-   - `action_pull_observations` — every 15 min via `@crontab_schedule("*/15 * * * *")`
-   - `action_pull_events` — every 15 min via `@crontab_schedule("*/15 * * * *")`
+   - `action_pull_observations` — every 15 min via `@crontab_schedule("*/15 * * * *")`. One fetch per cycle; emits Gundi observations for every position and, when `PullObservationsConfig.emit_events` is True (the default), additionally emits Gundi events for positions tagged with a Tracpoint event (`eventId != 0`).
 4. Handlers fetch from Tracpoint via `app/services/client.py::TracpointClient`, transform with `app/services/transformers.py`, and forward via `send_observations_to_gundi` / `send_events_to_gundi`
 
 ### Tracpoint SOAP specifics (`app/services/client.py`)
@@ -71,15 +70,15 @@ Tracpoint "events" are **tags on position records** (`eventId != 0`, e.g. "Speed
 - `transform_to_observations()` emits every position (tagged or not) as a Gundi observation, keyed by `assetId`. `subject_type` comes from `PullObservationsConfig` (default `"vehicle"`).
 - `transform_to_events()` emits only positions where `eventId` is non-zero, as Gundi events with `event_type = f"tracpoint_{snake_case(eventName)}"`.
 - A record tagged with an event therefore produces **both** an observation (continuous track) and an event (alert).
+- Both transformers run on the same fetched batch inside `action_pull_observations`; there is no separate "pull events" action.
 - Transformers swallow per-record errors and log a warning rather than aborting the batch.
 
 ### Action configurations (`app/actions/configurations.py`)
 
 - `AuthenticateConfig` — `wsdl_url`, `company`, `username`, `password` (`SecretStr`)
-- `PullObservationsConfig` — `lookback_days` (1–30, unused at the moment except as UI guidance — cursor logic uses `getAllPositions` on first run), `subject_type`
-- `PullEventsConfig` — `lookback_days` (same caveat)
+- `PullObservationsConfig` — `lookback_days` (1–30, unused at the moment except as UI guidance — cursor logic uses `getAllPositions` on first run), `subject_type`, `emit_events` (default `True`; flip off for tracking-only deployments that should not surface Tracpoint events in EarthRanger's alerts pane)
 
-All three use `FieldWithUIOptions` / `UIOptions` / `GlobalUISchemaOptions` to control how the Gundi portal renders the config forms (react-jsonschema-form ui schema).
+Both use `FieldWithUIOptions` / `UIOptions` / `GlobalUISchemaOptions` to control how the Gundi portal renders the config forms (react-jsonschema-form ui schema).
 
 ### Webhook path
 

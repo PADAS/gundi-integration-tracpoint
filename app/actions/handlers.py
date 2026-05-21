@@ -10,7 +10,7 @@ from app.services.tracpoint_cache import fetch_assets_cached
 from app.services.transformers import transform_to_observations, transform_to_events
 from gundi_core.events import LogLevel
 
-from .configurations import AuthenticateConfig, PullObservationsConfig, PullEventsConfig
+from .configurations import AuthenticateConfig, PullObservationsConfig
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +72,12 @@ async def action_pull_observations(integration, action_config: PullObservationsC
     """
     Fetch position records from Tracpoint for all assets and forward them to Gundi.
 
+    Each position is emitted as a Gundi observation, building the continuous
+    track per asset. Positions tagged with a Tracpoint event (eventId != 0 —
+    speeding, geofence breach, panic alert, etc.) are additionally emitted as
+    Gundi events when `action_config.emit_events` is True (the default), so
+    they surface in EarthRanger's alerts pane in addition to the track.
+
     Strategy:
       - First run (no state): fetch the most recent position snapshot for all assets
         via getAllPositions, then switch to incremental on the next run.
@@ -123,13 +129,19 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         )
         raise
 
-    # 4. Transform to Gundi format
+    # 4. Transform — every position is an observation; tagged positions are also events
     observations = transform_to_observations(all_raw, subject_type=action_config.subject_type)
+    events = transform_to_events(all_raw) if action_config.emit_events else []
 
     # 5. Send to Gundi
     if observations:
         await send_observations_to_gundi(
             observations=observations,
+            integration_id=integration_id,
+        )
+    if events:
+        await send_events_to_gundi(
+            events=events,
             integration_id=integration_id,
         )
 
@@ -148,98 +160,16 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         integration_id=integration_id,
         action_id="pull_observations",
         level=LogLevel.INFO,
-        title=f"Processed {len(observations)} observations from Tracpoint",
-        data={"observations_processed": len(observations), "raw_positions_fetched": len(all_raw)},
-        config_data=action_config.dict(),
-    )
-
-    return {"observations_processed": len(observations)}
-
-
-@crontab_schedule("*/15 * * * *")
-@activity_logger()
-async def action_pull_events(integration, action_config: PullEventsConfig):
-    """
-    Fetch event-tagged positions from Tracpoint and forward them to Gundi as events.
-
-    Tracpoint "events" are labels applied to position records (e.g. "Speeding",
-    "Geofence Entry"). This handler fetches positions and filters to those where
-    eventId != 0, forwarding each as a discrete Gundi event.
-    """
-    integration_id = str(integration.id)
-
-    # 1. Get auth config
-    auth_config = integration.get_action_config("auth")
-    client = _get_client(auth_config.data)
-
-    # 2. Determine time range
-    state = await state_manager.get_state(
-        integration_id=integration_id,
-        action_id="pull_events",
-    )
-    since = state.get("last_cursor") if state else None
-
-    # 3. Fetch from Tracpoint
-    all_raw: list[dict] = []
-    try:
-        if not since:
-            all_raw = await client.fetch_all_positions()
-        else:
-            end_ts = _now_tracpoint_ts()
-            start_ts = _to_tracpoint_ts(since)
-            assets = await fetch_assets_cached(client, integration_id)
-            for asset in assets:
-                asset_id = asset.get("assetId")
-                if asset_id is None:
-                    continue
-                positions = await client.fetch_positions_for_asset(
-                    asset_id=int(asset_id),
-                    start_timestamp=start_ts,
-                    end_timestamp=end_ts,
-                )
-                all_raw.extend(positions)
-    except Exception as e:
-        await log_action_activity(
-            integration_id=integration_id,
-            action_id="pull_events",
-            level=LogLevel.ERROR,
-            title="Failed to fetch event positions from Tracpoint",
-            data={"error": str(e)},
-            config_data=action_config.dict(),
-        )
-        raise
-
-    # 4. Transform — only positions tagged with an event
-    events = transform_to_events(all_raw)
-
-    # 5. Send to Gundi
-    if events:
-        await send_events_to_gundi(
-            events=events,
-            integration_id=integration_id,
-        )
-
-    # 6. Update state
-    if all_raw:
-        new_cursor = datetime.now(timezone.utc).isoformat()
-        await state_manager.set_state(
-            integration_id=integration_id,
-            action_id="pull_events",
-            state={"last_cursor": new_cursor},
-        )
-
-    # 7. Log summary
-    await log_action_activity(
-        integration_id=integration_id,
-        action_id="pull_events",
-        level=LogLevel.INFO,
-        title=f"Processed {len(events)} events from Tracpoint",
+        title=f"Processed {len(observations)} observations, {len(events)} events from Tracpoint",
         data={
+            "observations_processed": len(observations),
             "events_processed": len(events),
             "raw_positions_fetched": len(all_raw),
-            "event_tagged_positions": len([r for r in all_raw if r.get("eventId")]),
         },
         config_data=action_config.dict(),
     )
 
-    return {"events_processed": len(events)}
+    return {
+        "observations_processed": len(observations),
+        "events_processed": len(events),
+    }

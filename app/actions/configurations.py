@@ -40,7 +40,7 @@ class PullObservationsConfig(PullActionConfiguration):
         le=30,
         title="Lookback Days",
         description=(
-            "On the first run, fetch observations this many days back. "
+            "On the first run, fetch tracking data this many days back. "
             "Subsequent runs use an incremental cursor."
         ),
         ui_options=UIOptions(widget="range"),
@@ -53,21 +53,14 @@ class PullObservationsConfig(PullActionConfiguration):
             "Common values: vehicle, person, animal."
         ),
     )
-    ui_global_options = GlobalUISchemaOptions(order=["lookback_days", "subject_type"])
-
-
-class PullEventsConfig(PullActionConfiguration):
-    lookback_days: int = FieldWithUIOptions(
-        7,
-        ge=1,
-        le=30,
-        title="Lookback Days",
+    emit_events: bool = FieldWithUIOptions(
+        True,
+        title="Forward Tracpoint events to Gundi",
         description=(
-            "On the first run, fetch events this many days back. "
-            "Subsequent runs use an incremental cursor."
+            "When enabled, Tracpoint position records tagged with an event "
+            "(speeding, geofence breach, panic alert, etc.) are forwarded to "
+            "Gundi as discrete events in addition to observations. Disable for "
+            "tracking-only deployments that do not need alerts in EarthRanger."
         ),
-        ui_options=UIOptions(widget="range"),
     )
-    # TODO: Add any Tracpoint-specific event pull settings here
-    # (e.g. event type filters, severity filters, etc.)
-    ui_global_options = GlobalUISchemaOptions(order=["lookback_days"])
+    ui_global_options = GlobalUISchemaOptions(order=["lookback_days", "subject_type", "emit_events"])
