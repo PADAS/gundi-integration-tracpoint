@@ -1,1 +1,4 @@
 # Add your integration-specific dependencies here
+
+# SOAP client for Tracpoint web service
+zeep==4.3.2
