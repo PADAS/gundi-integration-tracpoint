@@ -42,7 +42,7 @@ cd local && docker compose up --build
 2. `app/services/action_runner.py::execute_action()` resolves the integration from Gundi, looks up the handler by `action_id`, and invokes it
 3. Action handlers live in `app/actions/handlers.py` — two are registered:
    - `action_auth` — validates SOAP creds by calling `getAllAssets`
-   - `action_pull_observations` — every 15 min via `@crontab_schedule("*/15 * * * *")`. One fetch per cycle; emits Gundi observations for every position and, when `PullObservationsConfig.emit_events` is True (the default), additionally emits Gundi events for positions tagged with a Tracpoint event (`eventId != 0`).
+   - `action_pull_observations` — every 2 min via `@crontab_schedule("*/2 * * * *")`. Single `getAllPositions` call per cycle; emits Gundi observations for every fresh position and, when `PullObservationsConfig.emit_events` is True (the default), additionally emits Gundi events for positions tagged with a Tracpoint event (`eventId != 0`).
 4. Handlers fetch from Tracpoint via `app/services/client.py::TracpointClient`, transform with `app/services/transformers.py`, and forward via `send_observations_to_gundi` / `send_events_to_gundi`
 
 ### Tracpoint SOAP specifics (`app/services/client.py`)
@@ -54,14 +54,15 @@ cd local && docker compose up --build
 - Timestamp format Tracpoint expects/returns: `"YYYY-MM-DD HH:MM:SS"` (naive, assume UTC)
 - `_check_status()` raises `RuntimeError` on non-`OK` status. `NO_POSITION_DATA` is treated as normal (empty list), not an error.
 
-### Incremental pull strategy
+### Pull strategy
 
-Both pull actions use a shared pattern, persisted in Redis via `IntegrationStateManager` (key: `integration_id` + `action_id`):
+Every cycle issues a single `getAllPositions` SOAP call — one network round-trip regardless of fleet size. Tracpoint returns the latest known position for each asset on every call, so we dedup client-side against a per-integration high-water mark stored in Redis via `IntegrationStateManager`:
 
-- **First run** (no `last_cursor`): call `getAllPositions` once for a snapshot of all assets' latest positions
-- **Subsequent runs**: enumerate assets via `getAllAssets`, then call `getSinglePositions` per asset with `[last_cursor, now]`
-- `last_cursor` is stored as an ISO-8601 UTC string and converted to Tracpoint format via `_to_tracpoint_ts()` on read
-- Cursor advances to "now" only when at least one raw record was returned — so empty fetches don't lose ground
+- `last_cursor` is an ISO-8601 UTC string holding the timestamp of the newest position previously forwarded.
+- Each cycle calls `filter_new_positions()` (in `app/actions/handlers.py`) — positions with `timestamp <= last_cursor` are dropped; the remainder are forwarded to Gundi and the cursor advances to the new maximum timestamp.
+- Cursor only advances when something was actually forwarded, so empty cycles (no asset moved) don't lose ground.
+- Per-asset `getSinglePositions` is not used in the hot loop. Trade-off: if a tracker reports multiple times inside one 2-min window, only the most recent fix is captured. This is acceptable for the fleets we currently target. Reintroduce per-asset queries if higher-resolution tracks are needed for a specific deployment.
+- `getAllAssets` is not called in the hot loop either. `app/services/tracpoint_cache.py` (`TracpointAssetCache`, `fetch_assets_cached`) remains in the codebase for future use (e.g., enriching observations with asset-type metadata) but is not invoked today.
 
 ### Observations vs. events (`app/services/transformers.py`)
 
@@ -76,7 +77,7 @@ Tracpoint "events" are **tags on position records** (`eventId != 0`, e.g. "Speed
 ### Action configurations (`app/actions/configurations.py`)
 
 - `AuthenticateConfig` — `wsdl_url`, `company`, `username`, `password` (`SecretStr`)
-- `PullObservationsConfig` — `lookback_days` (1–30, unused at the moment except as UI guidance — cursor logic uses `getAllPositions` on first run), `subject_type`, `emit_events` (default `True`; flip off for tracking-only deployments that should not surface Tracpoint events in EarthRanger's alerts pane)
+- `PullObservationsConfig` — `subject_type`, `emit_events` (default `True`; flip off for tracking-only deployments that should not surface Tracpoint events in EarthRanger's alerts pane)
 
 Both use `FieldWithUIOptions` / `UIOptions` / `GlobalUISchemaOptions` to control how the Gundi portal renders the config forms (react-jsonschema-form ui schema).
 

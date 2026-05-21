@@ -34,17 +34,6 @@ class AuthenticateConfig(AuthActionConfiguration):
 
 
 class PullObservationsConfig(PullActionConfiguration):
-    lookback_days: int = FieldWithUIOptions(
-        7,
-        ge=1,
-        le=30,
-        title="Lookback Days",
-        description=(
-            "On the first run, fetch tracking data this many days back. "
-            "Subsequent runs use an incremental cursor."
-        ),
-        ui_options=UIOptions(widget="range"),
-    )
     subject_type: str = FieldWithUIOptions(
         "vehicle",
         title="Subject Type",
@@ -63,4 +52,4 @@ class PullObservationsConfig(PullActionConfiguration):
             "tracking-only deployments that do not need alerts in EarthRanger."
         ),
     )
-    ui_global_options = GlobalUISchemaOptions(order=["lookback_days", "subject_type", "emit_events"])
+    ui_global_options = GlobalUISchemaOptions(order=["subject_type", "emit_events"])

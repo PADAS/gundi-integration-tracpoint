@@ -1,12 +1,12 @@
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
+from typing import Any
 
 from app.services.activity_logger import activity_logger, log_action_activity
 from app.services.action_scheduler import crontab_schedule
 from app.services.gundi import send_observations_to_gundi, send_events_to_gundi
 from app.services.state import IntegrationStateManager
 from app.services.client import TracpointClient
-from app.services.tracpoint_cache import fetch_assets_cached
 from app.services.transformers import transform_to_observations, transform_to_events
 from gundi_core.events import LogLevel
 
@@ -16,20 +16,8 @@ logger = logging.getLogger(__name__)
 
 state_manager = IntegrationStateManager()
 
-# Tracpoint timestamp format for getSinglePositions parameters: "YYYY-MM-DD HH:MM:SS"
-_TS_FORMAT = "%Y-%m-%d %H:%M:%S"
-
-
-def _to_tracpoint_ts(iso_string: str) -> str:
-    """Convert an ISO 8601 string to Tracpoint's expected timestamp format."""
-    # Handle both "2024-01-01T00:00:00+00:00" and "2024-01-01T00:00:00Z"
-    iso_string = iso_string.replace("Z", "+00:00")
-    dt = datetime.fromisoformat(iso_string).astimezone(timezone.utc)
-    return dt.strftime(_TS_FORMAT)
-
-
-def _now_tracpoint_ts() -> str:
-    return datetime.now(timezone.utc).strftime(_TS_FORMAT)
+# Tracpoint position timestamp format: "YYYY-MM-DD HH:MM:SS" (naive, UTC).
+_POSITION_TS_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 def _get_client(auth_data: dict) -> TracpointClient:
@@ -39,6 +27,51 @@ def _get_client(auth_data: dict) -> TracpointClient:
         username=auth_data.get("username", ""),
         password=auth_data.get("password", ""),
     )
+
+
+def _parse_cursor(value: str | None) -> datetime | None:
+    """Parse an ISO 8601 high-water-mark string into a tz-aware datetime."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_position_ts(raw: Any) -> datetime | None:
+    """Parse a Tracpoint position timestamp string into a tz-aware UTC datetime."""
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(str(raw).strip(), _POSITION_TS_FORMAT).replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
+def filter_new_positions(
+    raw: list[dict[str, Any]],
+    cursor: datetime | None,
+) -> tuple[list[dict[str, Any]], datetime | None]:
+    """Return positions newer than `cursor` plus the new high-water mark.
+
+    `getAllPositions` returns the latest known position for every asset on
+    every call, including assets that haven't reported since the last cycle.
+    Filtering against the cursor ensures we forward each position to Gundi
+    exactly once.
+    """
+    new_raw: list[dict[str, Any]] = []
+    max_dt = cursor
+    for pos in raw:
+        pos_dt = _parse_position_ts(pos.get("timestamp"))
+        if pos_dt is None:
+            continue
+        if cursor is not None and pos_dt <= cursor:
+            continue
+        new_raw.append(pos)
+        if max_dt is None or pos_dt > max_dt:
+            max_dt = pos_dt
+    return new_raw, max_dt
 
 
 @activity_logger()
@@ -66,58 +99,45 @@ async def action_auth(integration, action_config: AuthenticateConfig):
     return {"valid_credentials": True, "assets_visible": len(assets)}
 
 
-@crontab_schedule("*/15 * * * *")
+@crontab_schedule("*/2 * * * *")
 @activity_logger()
 async def action_pull_observations(integration, action_config: PullObservationsConfig):
     """
-    Fetch position records from Tracpoint for all assets and forward them to Gundi.
+    Fetch the latest position per asset from Tracpoint and forward new ones to Gundi.
 
-    Each position is emitted as a Gundi observation, building the continuous
-    track per asset. Positions tagged with a Tracpoint event (eventId != 0 —
-    speeding, geofence breach, panic alert, etc.) are additionally emitted as
-    Gundi events when `action_config.emit_events` is True (the default), so
-    they surface in EarthRanger's alerts pane in addition to the track.
+    Every cycle calls `getAllPositions` exactly once — a single SOAP call
+    regardless of fleet size. Tracpoint returns the latest known position for
+    every asset; we dedup client-side against the previous cycle's high-water
+    mark stored in Redis, so an asset that has not reported new data is
+    silently filtered out.
 
-    Strategy:
-      - First run (no state): fetch the most recent position snapshot for all assets
-        via getAllPositions, then switch to incremental on the next run.
-      - Subsequent runs: for each asset, call getSinglePositions with
-        [last_cursor, now] to retrieve only new positions.
+    Each forwarded position becomes a Gundi observation. Positions tagged with
+    a Tracpoint event (eventId != 0 — speeding, geofence breach, panic alert,
+    etc.) additionally become Gundi events when `action_config.emit_events`
+    is True (the default), surfacing them in EarthRanger's alerts pane.
+
+    Trade-off vs. per-asset `getSinglePositions`: if a tracker reports multiple
+    positions inside one polling window we see only the most recent. At the
+    configured 2-minute cadence this is rarely a concern in practice — most
+    trackers transmit at intervals close to or longer than 2 min, so we
+    capture essentially every fix.
     """
     integration_id = str(integration.id)
 
-    # 1. Get auth config
+    # 1. Auth config
     auth_config = integration.get_action_config("auth")
     client = _get_client(auth_config.data)
 
-    # 2. Determine time range using persisted state
+    # 2. Persisted high-water mark
     state = await state_manager.get_state(
         integration_id=integration_id,
         action_id="pull_observations",
     )
-    since = state.get("last_cursor") if state else None
+    since = _parse_cursor(state.get("last_cursor") if state else None)
 
-    # 3. Fetch from Tracpoint
-    all_raw: list[dict] = []
+    # 3. Single fetch
     try:
-        if not since:
-            # First run — snapshot of current positions
-            all_raw = await client.fetch_all_positions()
-        else:
-            # Incremental — per-asset time-range query
-            end_ts = _now_tracpoint_ts()
-            start_ts = _to_tracpoint_ts(since)
-            assets = await fetch_assets_cached(client, integration_id)
-            for asset in assets:
-                asset_id = asset.get("assetId")
-                if asset_id is None:
-                    continue
-                positions = await client.fetch_positions_for_asset(
-                    asset_id=int(asset_id),
-                    start_timestamp=start_ts,
-                    end_timestamp=end_ts,
-                )
-                all_raw.extend(positions)
+        raw = await client.fetch_all_positions()
     except Exception as e:
         await log_action_activity(
             integration_id=integration_id,
@@ -129,11 +149,14 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         )
         raise
 
-    # 4. Transform — every position is an observation; tagged positions are also events
-    observations = transform_to_observations(all_raw, subject_type=action_config.subject_type)
-    events = transform_to_events(all_raw) if action_config.emit_events else []
+    # 4. Filter to positions newer than the cursor; track the new high-water mark
+    new_raw, new_cursor = filter_new_positions(raw, since)
 
-    # 5. Send to Gundi
+    # 5. Transform — every fresh position is an observation; tagged positions are also events
+    observations = transform_to_observations(new_raw, subject_type=action_config.subject_type)
+    events = transform_to_events(new_raw) if action_config.emit_events else []
+
+    # 6. Send to Gundi
     if observations:
         await send_observations_to_gundi(
             observations=observations,
@@ -145,17 +168,15 @@ async def action_pull_observations(integration, action_config: PullObservationsC
             integration_id=integration_id,
         )
 
-    # 6. Update state — use current time as the next high-water mark
-    #    (Tracpoint timestamp field is a string; we store ISO format for portability)
-    if all_raw:
-        new_cursor = datetime.now(timezone.utc).isoformat()
+    # 7. Advance cursor only when we actually forwarded something
+    if new_raw and new_cursor is not None:
         await state_manager.set_state(
             integration_id=integration_id,
             action_id="pull_observations",
-            state={"last_cursor": new_cursor},
+            state={"last_cursor": new_cursor.isoformat()},
         )
 
-    # 7. Log summary
+    # 8. Log summary
     await log_action_activity(
         integration_id=integration_id,
         action_id="pull_observations",
@@ -164,7 +185,8 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         data={
             "observations_processed": len(observations),
             "events_processed": len(events),
-            "raw_positions_fetched": len(all_raw),
+            "raw_positions_fetched": len(raw),
+            "new_positions_after_dedup": len(new_raw),
         },
         config_data=action_config.dict(),
     )
