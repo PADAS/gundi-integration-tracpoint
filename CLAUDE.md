@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this integration does
 
-This is the **Gundi v2 ↔ Tracpoint integration**. It pulls GPS position records from the Tracpoint (Terramar Networks v7) SOAP service and forwards them to [Gundi](https://gundiservice.org) as observations and events.
+This is the **Gundi v2 ↔ Tracpoint integration**. It pulls GPS position records from the Tracpoint (Terramar Networks v10) SOAP service and forwards them to [Gundi](https://gundiservice.org) as observations and events.
 
 The upstream `gundi-integration-action-runner` template (which this repo was forked from) supports webhook ingress with JQ transforms and dynamic schemas. **None of that applies here** — this integration is pull-driven via PubSub-triggered cron actions, not webhook-driven. `app/webhooks/handlers.py` and `app/webhooks/configurations.py` are intentionally empty.
 
@@ -50,7 +50,7 @@ cd local && docker compose up --build
 
 - WSDL-based async SOAP via `zeep.AsyncClient` (RPC/encoded, SOAP 1.1, `strict=False`)
 - **No session/token** — `userCompany`, `userName`, `userPassword` are passed in every operation's body
-- Default endpoint: `http://www.terramarnetworks.net/v7/index.php?wsdl` (overridable per integration via `AuthenticateConfig.wsdl_url`)
+- Default endpoint: `https://www.terramarnetworks.net/v10/index.php?wsdl` (overridable per integration via `AuthenticateConfig.wsdl_url`; legacy v7 endpoint is wire-compatible if a customer needs to stay on it)
 - Operations used: `getAllAssets`, `getAllPositions`, `getSinglePositions(assetId, startTimestamp, endTimestamp)`, `getEvents`
 - Timestamp format Tracpoint expects/returns: `"YYYY-MM-DD HH:MM:SS"` (naive, assume UTC)
 - `_check_status()` raises `RuntimeError` on non-`OK` status. `NO_POSITION_DATA` is treated as normal (empty list), not an error.

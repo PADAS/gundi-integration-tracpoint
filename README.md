@@ -1,6 +1,6 @@
 # gundi-integration-tracpoint
 
-Gundi v2 Action Runner for the **Tracpoint** GPS tracking service (Terramar Networks v7 SOAP).
+Gundi v2 Action Runner for the **Tracpoint** GPS tracking service (Terramar Networks v10 SOAP).
 
 Pulls GPS position records from a Tracpoint customer account on a 2-minute cadence and forwards them to [Gundi](https://gundiservice.org) as observations. Optionally forwards Tracpoint event tags (speeding, geofence breach, panic alert, etc.) as Gundi events for surfacing in EarthRanger's alerts pane.
 
@@ -28,7 +28,7 @@ Tracpoint requires that web-service access be **explicitly enabled by Terramar N
 
 | Field | Type | Notes |
 |---|---|---|
-| `wsdl_url` | str | Default `http://www.terramarnetworks.net/v7/index.php?wsdl`. Override if your tenant uses a different endpoint. |
+| `wsdl_url` | str | Default `https://www.terramarnetworks.net/v10/index.php?wsdl`. Override if your tenant uses a different endpoint (e.g., for legacy deployments still on v7). |
 | `company` | str | `userCompany` value — your Tracpoint company name or alias. |
 | `username` | str | `userName` — Tracpoint service-account user. |
 | `password` | `SecretStr` | `userPassword`. |
