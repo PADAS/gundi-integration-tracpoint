@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 from typing import Any
 
 import httpx
@@ -15,8 +16,22 @@ from app.services.zeep_cache import get_default_cache
 logger = logging.getLogger(__name__)
 
 # Set DEBUG_SOAP_ENVELOPES=1 to log the SOAP envelope when Tracpoint returns
-# a non-OK status. Useful when diagnosing auth or wire-format issues.
+# a non-OK status. Useful when diagnosing auth or wire-format issues. The
+# envelope is scrubbed of credentials before logging (see _redact_credentials).
 DEBUG_SOAP_ENVELOPES = os.environ.get("DEBUG_SOAP_ENVELOPES", "").lower() in ("1", "true", "yes")
+
+# Matches the credential elements zeep emits inside the SOAP body (no
+# namespace prefix in Tracpoint's RPC/encoded style). Captures the open
+# tag and close tag so the inner value can be replaced with a placeholder
+# without touching attributes or whitespace.
+_CREDENTIAL_ELEMENTS_RE = re.compile(
+    r"(<(userCompany|userName|userPassword)>)[^<]*(</\2>)"
+)
+
+
+def _redact_credentials(envelope_xml: str) -> str:
+    """Replace credential values in a SOAP envelope so they don't leak into logs."""
+    return _CREDENTIAL_ELEMENTS_RE.sub(r"\1***REDACTED***\3", envelope_xml)
 
 # Tracpoint SOAP service — Terramar Networks v7
 # Namespace: http://www.terramarnetworks.net/v7
@@ -34,6 +49,9 @@ DEBUG_SOAP_ENVELOPES = os.environ.get("DEBUG_SOAP_ENVELOPES", "").lower() in ("1
 # and the DEBUG_SOAP_ENVELOPES dump only reads the most recent envelope.
 _async_clients: dict[str, AsyncClient] = {}
 _histories: dict[str, HistoryPlugin] = {}
+# Underlying httpx clients owned by the AsyncClient cache. Tracked here so we
+# can close their connection pools at process shutdown (see aclose_client_cache).
+_owned_httpx_clients: list[httpx.AsyncClient | httpx.Client] = []
 
 
 def _build_async_client(wsdl_url: str, timeout: float) -> tuple[AsyncClient, HistoryPlugin]:
@@ -47,6 +65,8 @@ def _build_async_client(wsdl_url: str, timeout: float) -> tuple[AsyncClient, His
     history = HistoryPlugin()
     soap_client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
     wsdl_client = httpx.Client(timeout=timeout, follow_redirects=True)
+    _owned_httpx_clients.append(soap_client)
+    _owned_httpx_clients.append(wsdl_client)
     transport = AsyncTransport(
         client=soap_client,
         wsdl_client=wsdl_client,
@@ -63,7 +83,34 @@ def _build_async_client(wsdl_url: str, timeout: float) -> tuple[AsyncClient, His
 
 
 def reset_client_cache() -> None:
-    """Drop the process-wide AsyncClient cache. Intended for tests."""
+    """Drop the process-wide AsyncClient cache. Intended for tests.
+
+    Does NOT close the underlying httpx clients — tests that create real
+    sockets should use `aclose_client_cache()` instead. Sync callers that
+    just want to forget cached AsyncClients (e.g., to force a rebuild) can
+    use this without going async.
+    """
+    _async_clients.clear()
+    _histories.clear()
+
+
+async def aclose_client_cache() -> None:
+    """Close all httpx clients owned by the AsyncClient cache and forget them.
+
+    Call from the FastAPI lifespan shutdown hook so connection pools don't
+    leak across process restarts in environments that reuse the Python
+    runtime (some test harnesses, hot-reload servers, etc.). In Cloud Run
+    the OS reclaims the sockets when the instance exits regardless.
+    """
+    for client in _owned_httpx_clients:
+        try:
+            if isinstance(client, httpx.AsyncClient):
+                await client.aclose()
+            else:
+                client.close()
+        except Exception as exc:
+            logger.warning("Failed to close httpx client during shutdown: %s", exc)
+    _owned_httpx_clients.clear()
     _async_clients.clear()
     _histories.clear()
 
@@ -119,7 +166,7 @@ class TracpointClient:
         if code != "OK":
             if DEBUG_SOAP_ENVELOPES and self._history and self._history.last_sent:
                 sent = etree.tostring(self._history.last_sent["envelope"], pretty_print=True).decode()
-                logger.error("Tracpoint SOAP envelope sent:\n%s", sent)
+                logger.error("Tracpoint SOAP envelope sent:\n%s", _redact_credentials(sent))
             raise RuntimeError(
                 f"Tracpoint {operation} returned status {code}: {description}"
             )
@@ -150,8 +197,17 @@ class TracpointClient:
     async def fetch_all_positions(self) -> list[dict[str, Any]]:
         """
         Return the most recent position for every asset.
-        Use this only on the very first run (no state) when you just want a
-        current snapshot. For incremental pulls, use fetch_positions_for_asset().
+
+        This is the **primary** fetch method in this integration's hot loop —
+        `action_pull_observations` calls it every cycle, and client-side dedup
+        (`filter_new_positions` in `app/actions/handlers.py`) discards any
+        positions whose `(timestamp, inboundId)` is not strictly greater than
+        the previously stored high-water mark. Trade-off: if a tracker reports
+        multiple times inside one polling window we capture only the most
+        recent fix.
+
+        Use `fetch_positions_for_asset()` only if you need higher-resolution
+        per-asset history within an explicit time range.
         """
         client = self._get_client()
         result = await client.service.getAllPositions(**self._creds())

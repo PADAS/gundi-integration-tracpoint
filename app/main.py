@@ -12,6 +12,7 @@ import app.settings as settings
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.services.action_runner import execute_action, _portal
+from app.services.client import aclose_client_cache
 from app.services.self_registration import register_integration_in_gundi
 
 
@@ -28,6 +29,7 @@ async def lifespan(app: FastAPI):
     yield
     # Shotdown Hook
     await _portal.close()
+    await aclose_client_cache()
 
 
 app = FastAPI(

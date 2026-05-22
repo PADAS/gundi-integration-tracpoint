@@ -1,6 +1,6 @@
 import logging
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional, Tuple, Union
 
 from app.services.activity_logger import activity_logger, log_action_activity
 from app.services.action_scheduler import crontab_schedule
@@ -18,6 +18,12 @@ state_manager = IntegrationStateManager()
 
 # Tracpoint position timestamp format: "YYYY-MM-DD HH:MM:SS" (naive, UTC).
 _POSITION_TS_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+# Composite cursor = (position timestamp, inboundId tie-breaker).
+# The inboundId slot may be float("+inf") for legacy state that predates the
+# tie-breaker — see `_load_cursor_from_state` — which preserves the old
+# drop-on-equality dedup behavior until the cursor advances.
+Cursor = Tuple[datetime, Union[int, float]]
 
 
 def _get_client(auth_data: dict) -> TracpointClient:
@@ -49,29 +55,61 @@ def _parse_position_ts(raw: Any) -> datetime | None:
         return None
 
 
+def _load_cursor_from_state(state: dict | None) -> Optional[Cursor]:
+    """Read the persisted high-water mark, handling pre-tie-breaker state.
+
+    Modern state has both `last_cursor` (ISO timestamp) and `last_cursor_inbound_id`.
+    Legacy state from before the tie-breaker has only `last_cursor`; in that
+    case we use +inf for the inboundId slot so the legacy drop-on-equality
+    semantics are preserved until the cursor advances to a newer timestamp.
+    """
+    if not state:
+        return None
+    ts = _parse_cursor(state.get("last_cursor"))
+    if ts is None:
+        return None
+    inbound = state.get("last_cursor_inbound_id")
+    if isinstance(inbound, int):
+        return (ts, inbound)
+    return (ts, float("inf"))
+
+
+def _cursor_for_position(pos: dict[str, Any]) -> Optional[Cursor]:
+    """Build the cursor tuple for a single position record. None if unusable."""
+    pos_dt = _parse_position_ts(pos.get("timestamp"))
+    if pos_dt is None:
+        return None
+    inbound = pos.get("inboundId")
+    # Tracpoint documents inboundId as a globally unique identifier; treat a
+    # missing value as -1 so positions without one still sort below those with.
+    inbound_val: int = inbound if isinstance(inbound, int) else -1
+    return (pos_dt, inbound_val)
+
+
 def filter_new_positions(
     raw: list[dict[str, Any]],
-    cursor: datetime | None,
-) -> tuple[list[dict[str, Any]], datetime | None]:
-    """Return positions newer than `cursor` plus the new high-water mark.
+    cursor: Optional[Cursor],
+) -> tuple[list[dict[str, Any]], Optional[Cursor]]:
+    """Return positions strictly newer than `cursor` plus the new high-water mark.
 
     `getAllPositions` returns the latest known position for every asset on
     every call, including assets that haven't reported since the last cycle.
-    Filtering against the cursor ensures we forward each position to Gundi
-    exactly once.
+    The cursor is a `(timestamp, inboundId)` tuple — using the inboundId as a
+    tie-breaker means two assets reporting at the exact same second don't
+    cause us to drop one of them. Tuples compare lexicographically in Python.
     """
     new_raw: list[dict[str, Any]] = []
-    max_dt = cursor
+    max_cursor = cursor
     for pos in raw:
-        pos_dt = _parse_position_ts(pos.get("timestamp"))
-        if pos_dt is None:
+        pos_cursor = _cursor_for_position(pos)
+        if pos_cursor is None:
             continue
-        if cursor is not None and pos_dt <= cursor:
+        if cursor is not None and pos_cursor <= cursor:
             continue
         new_raw.append(pos)
-        if max_dt is None or pos_dt > max_dt:
-            max_dt = pos_dt
-    return new_raw, max_dt
+        if max_cursor is None or pos_cursor > max_cursor:
+            max_cursor = pos_cursor
+    return new_raw, max_cursor
 
 
 @activity_logger()
@@ -114,7 +152,9 @@ async def action_pull_observations(integration, action_config: PullObservationsC
     Each forwarded position becomes a Gundi observation. Positions tagged with
     a Tracpoint event (eventId != 0 — speeding, geofence breach, panic alert,
     etc.) additionally become Gundi events when `action_config.emit_events`
-    is True (the default), surfacing them in EarthRanger's alerts pane.
+    is True. The default is False until Gundi's dispatcher-side reference-data
+    provisioning is in place — without that, EarthRanger rejects unknown event
+    types on POST.
 
     Trade-off vs. per-asset `getSinglePositions`: if a tracker reports multiple
     positions inside one polling window we see only the most recent. At the
@@ -133,7 +173,7 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         integration_id=integration_id,
         action_id="pull_observations",
     )
-    since = _parse_cursor(state.get("last_cursor") if state else None)
+    since = _load_cursor_from_state(state)
 
     # 3. Single fetch
     try:
@@ -168,12 +208,18 @@ async def action_pull_observations(integration, action_config: PullObservationsC
             integration_id=integration_id,
         )
 
-    # 7. Advance cursor only when we actually forwarded something
+    # 7. Advance cursor only when we actually forwarded something. new_cursor
+    #    will always have a concrete int inbound_id at this point (any legacy
+    #    +inf sentinel sits in `since`, never in the max derived from new_raw).
     if new_raw and new_cursor is not None:
+        new_ts, new_inbound = new_cursor
         await state_manager.set_state(
             integration_id=integration_id,
             action_id="pull_observations",
-            state={"last_cursor": new_cursor.isoformat()},
+            state={
+                "last_cursor": new_ts.isoformat(),
+                "last_cursor_inbound_id": new_inbound,
+            },
         )
 
     # 8. Log summary

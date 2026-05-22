@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import pytest
 
 from app.actions.handlers import (
+    _load_cursor_from_state,
     _parse_cursor,
     _parse_position_ts,
     filter_new_positions,
@@ -48,39 +49,100 @@ def test_parse_position_ts_returns_none_on_unexpected_format():
 
 
 # ---------------------------------------------------------------------------
+# _load_cursor_from_state
+# ---------------------------------------------------------------------------
+
+def test_load_cursor_returns_none_when_state_empty():
+    assert _load_cursor_from_state(None) is None
+    assert _load_cursor_from_state({}) is None
+
+
+def test_load_cursor_modern_state_returns_tuple_with_inbound_id():
+    state = {"last_cursor": "2026-05-21T10:00:00+00:00", "last_cursor_inbound_id": 42}
+    cursor = _load_cursor_from_state(state)
+    assert cursor == (datetime(2026, 5, 21, 10, 0, tzinfo=timezone.utc), 42)
+
+
+def test_load_cursor_legacy_state_uses_infinity_to_preserve_drop_on_equality():
+    """Pre-tie-breaker state has only `last_cursor`; using +inf preserves
+    the previous behavior where any position at the same timestamp gets
+    dropped on the first post-upgrade cycle."""
+    state = {"last_cursor": "2026-05-21T10:00:00+00:00"}
+    cursor = _load_cursor_from_state(state)
+    assert cursor[0] == datetime(2026, 5, 21, 10, 0, tzinfo=timezone.utc)
+    assert cursor[1] == float("inf")
+
+
+# ---------------------------------------------------------------------------
 # filter_new_positions
 # ---------------------------------------------------------------------------
 
-def _pos(ts: str, asset_id: int = 1) -> dict:
-    return {"assetId": asset_id, "timestamp": ts, "latitude": 0.0, "longitude": 0.0}
+def _pos(ts: str, asset_id: int = 1, inbound_id: int = 100) -> dict:
+    return {
+        "assetId": asset_id,
+        "inboundId": inbound_id,
+        "timestamp": ts,
+        "latitude": 0.0,
+        "longitude": 0.0,
+    }
 
 
-def test_first_run_keeps_everything_and_returns_max_timestamp():
+def test_first_run_keeps_everything_and_returns_max_cursor():
     raw = [
-        _pos("2026-05-21 10:00:00", asset_id=1),
-        _pos("2026-05-21 10:05:00", asset_id=2),
-        _pos("2026-05-21 09:55:00", asset_id=3),
+        _pos("2026-05-21 10:00:00", asset_id=1, inbound_id=10),
+        _pos("2026-05-21 10:05:00", asset_id=2, inbound_id=20),
+        _pos("2026-05-21 09:55:00", asset_id=3, inbound_id=5),
     ]
     new, cursor = filter_new_positions(raw, cursor=None)
     assert len(new) == 3
-    assert cursor == datetime(2026, 5, 21, 10, 5, tzinfo=timezone.utc)
+    assert cursor == (datetime(2026, 5, 21, 10, 5, tzinfo=timezone.utc), 20)
 
 
 def test_drops_positions_at_or_before_cursor():
-    cursor = datetime(2026, 5, 21, 10, 0, tzinfo=timezone.utc)
+    cursor = (datetime(2026, 5, 21, 10, 0, tzinfo=timezone.utc), 50)
     raw = [
-        _pos("2026-05-21 09:59:00", asset_id=1),  # older
-        _pos("2026-05-21 10:00:00", asset_id=2),  # equal — already submitted
-        _pos("2026-05-21 10:01:00", asset_id=3),  # newer — keep
+        _pos("2026-05-21 09:59:00", asset_id=1, inbound_id=999),  # older ts — drop
+        _pos("2026-05-21 10:00:00", asset_id=2, inbound_id=50),   # equal cursor — drop
+        _pos("2026-05-21 10:00:00", asset_id=3, inbound_id=49),   # equal ts, lower id — drop
+        _pos("2026-05-21 10:00:00", asset_id=4, inbound_id=51),   # equal ts, higher id — keep
+        _pos("2026-05-21 10:01:00", asset_id=5, inbound_id=1),    # newer ts — keep
     ]
     new, new_cursor = filter_new_positions(raw, cursor)
-    assert [p["assetId"] for p in new] == [3]
-    assert new_cursor == datetime(2026, 5, 21, 10, 1, tzinfo=timezone.utc)
+    assert [p["assetId"] for p in new] == [4, 5]
+    assert new_cursor == (datetime(2026, 5, 21, 10, 1, tzinfo=timezone.utc), 1)
+
+
+def test_tie_breaker_prevents_dropping_concurrent_assets():
+    """Two different assets reporting at the exact same second must both
+    be forwarded — this was the bug the composite cursor fixes."""
+    raw = [
+        _pos("2026-05-21 10:00:00", asset_id=1, inbound_id=100),
+        _pos("2026-05-21 10:00:00", asset_id=2, inbound_id=101),
+        _pos("2026-05-21 10:00:00", asset_id=3, inbound_id=102),
+    ]
+    new, cursor = filter_new_positions(raw, cursor=None)
+    assert [p["assetId"] for p in new] == [1, 2, 3]
+    assert cursor == (datetime(2026, 5, 21, 10, 0, tzinfo=timezone.utc), 102)
+
+
+def test_legacy_infinity_cursor_drops_everything_at_legacy_ts():
+    """Modeled after the post-migration first cycle: legacy state had only
+    a timestamp, so +inf is used as the inbound_id slot. Records at that
+    timestamp should all be dropped (matching pre-upgrade behavior)."""
+    cursor = (datetime(2026, 5, 21, 10, 0, tzinfo=timezone.utc), float("inf"))
+    raw = [
+        _pos("2026-05-21 10:00:00", asset_id=1, inbound_id=10_000_000),
+        _pos("2026-05-21 10:01:00", asset_id=2, inbound_id=1),
+    ]
+    new, new_cursor = filter_new_positions(raw, cursor)
+    assert [p["assetId"] for p in new] == [2]
+    # Cursor advances to the next-cycle value and the infinity sentinel is gone.
+    assert new_cursor == (datetime(2026, 5, 21, 10, 1, tzinfo=timezone.utc), 1)
 
 
 def test_cursor_unchanged_when_nothing_is_new():
-    cursor = datetime(2026, 5, 21, 10, 0, tzinfo=timezone.utc)
-    raw = [_pos("2026-05-21 09:59:00")]
+    cursor = (datetime(2026, 5, 21, 10, 0, tzinfo=timezone.utc), 50)
+    raw = [_pos("2026-05-21 09:59:00", asset_id=1, inbound_id=999)]
     new, new_cursor = filter_new_positions(raw, cursor)
     assert new == []
     assert new_cursor == cursor
@@ -88,16 +150,24 @@ def test_cursor_unchanged_when_nothing_is_new():
 
 def test_positions_with_unparseable_timestamps_are_skipped():
     raw = [
-        _pos("garbage", asset_id=1),
-        _pos("2026-05-21 10:00:00", asset_id=2),
+        _pos("garbage", asset_id=1, inbound_id=5),
+        _pos("2026-05-21 10:00:00", asset_id=2, inbound_id=10),
     ]
     new, cursor = filter_new_positions(raw, cursor=None)
     assert [p["assetId"] for p in new] == [2]
-    assert cursor == datetime(2026, 5, 21, 10, 0, tzinfo=timezone.utc)
+    assert cursor == (datetime(2026, 5, 21, 10, 0, tzinfo=timezone.utc), 10)
+
+
+def test_positions_with_missing_inbound_id_get_minus_one_slot():
+    """Inbound id missing from a record shouldn't crash; -1 sentinel is used."""
+    raw = [{"assetId": 1, "timestamp": "2026-05-21 10:00:00", "latitude": 0, "longitude": 0}]
+    new, cursor = filter_new_positions(raw, cursor=None)
+    assert len(new) == 1
+    assert cursor == (datetime(2026, 5, 21, 10, 0, tzinfo=timezone.utc), -1)
 
 
 def test_empty_input_returns_empty_and_preserves_cursor():
-    cursor = datetime(2026, 5, 21, 10, 0, tzinfo=timezone.utc)
+    cursor = (datetime(2026, 5, 21, 10, 0, tzinfo=timezone.utc), 50)
     new, new_cursor = filter_new_positions([], cursor)
     assert new == []
     assert new_cursor == cursor

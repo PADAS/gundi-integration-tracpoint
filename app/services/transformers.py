@@ -1,7 +1,11 @@
 import logging
+from datetime import datetime
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Tracpoint emits position timestamps in this format (naive, UTC assumed).
+_TRACPOINT_TS_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 # Tracpoint Position schema (from WSDL):
 #   inboundId, assetId, assetDisplayName,
@@ -25,17 +29,19 @@ def _parse_timestamp(raw_ts: Any) -> str | None:
     """
     Normalise a Tracpoint timestamp string to ISO 8601 with UTC offset.
     Tracpoint returns naive datetime strings like "2024-03-01 14:30:00" (UTC assumed).
-    Returns None if the value is missing or unparseable.
+    Returns None if the value is missing, empty, or does not parse as the
+    expected `YYYY-MM-DD HH:MM:SS` format.
     """
     if not raw_ts:
         return None
     ts = str(raw_ts).strip()
     if not ts:
         return None
-    # Naive datetime string — treat as UTC
-    if "T" not in ts and "+" not in ts and not ts.endswith("Z"):
-        ts = ts.replace(" ", "T") + "+00:00"
-    return ts
+    try:
+        datetime.strptime(ts, _TRACPOINT_TS_FORMAT)
+    except (ValueError, TypeError):
+        return None
+    return ts.replace(" ", "T") + "+00:00"
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +71,7 @@ def transform_to_observations(
     return observations
 
 
-def _transform_observation(record: dict[str, Any], subject_type: str = "truck") -> dict[str, Any] | None:
+def _transform_observation(record: dict[str, Any], subject_type: str = "vehicle") -> dict[str, Any] | None:
     source = record.get("assetId")
     if source is None:
         logger.warning("Position record missing assetId, skipping")
@@ -91,7 +97,7 @@ def _transform_observation(record: dict[str, Any], subject_type: str = "truck") 
         additional["course"] = record["course"]
     if record.get("fix") is not None:
         additional["gps_fix"] = record["fix"]
-    if record.get("lifetimeOdometer"):
+    if record.get("lifetimeOdometer") is not None:
         additional["lifetime_odometer"] = record["lifetimeOdometer"]
     # Location context fields
     for field in ("road", "area", "town", "county", "state", "country", "postcode"):
@@ -151,8 +157,9 @@ def _transform_event(record: dict[str, Any]) -> dict[str, Any] | None:
     lon = record.get("longitude")
     location = {"lat": float(lat), "lon": float(lon)} if lat is not None and lon is not None else None
 
+    asset_label = record.get("assetDisplayName") or record.get("assetId") or "unknown"
     return {
-        "title": f"{record.get('assetDisplayName', record.get('assetId'))}: {event_name}",
+        "title": f"{asset_label}: {event_name}",
         "event_type": event_type,
         "recorded_at": recorded_at,
         "location": location,

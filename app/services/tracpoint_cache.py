@@ -1,11 +1,16 @@
-"""Redis-backed TTL cache for Tracpoint API responses.
+"""Redis-backed TTL cache for the Tracpoint asset roster.
 
-Currently used for the asset roster, which rarely changes but is fetched
-on every incremental pull cycle. Caching it cuts the steady-state
-`getAllAssets` call rate from ~190/day per integration to ~24/day at the
-default 1-hour TTL.
+**Currently dormant in the hot loop.** `action_pull_observations` calls
+`getAllPositions` once per cycle, which already returns every asset's
+latest position, so we no longer enumerate assets via `getAllAssets`.
 
-Set `TRACPOINT_ASSET_CACHE_TTL` (seconds) to override the default.
+This module is retained for future use cases that need asset metadata
+beyond what `getAllPositions` includes — for example, enriching Gundi
+observations with `assetTypeName`, `make`, `model`, etc. from
+`getSingleAsset`. When wired back in, callers should prefer
+`fetch_assets_cached(client, integration_id)` so we never re-query the
+roster more than once per `TRACPOINT_ASSET_CACHE_TTL` window (default
+1h; override via env var).
 """
 import json
 import logging
