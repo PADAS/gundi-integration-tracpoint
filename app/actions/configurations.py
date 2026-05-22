@@ -6,11 +6,11 @@ from app.services.utils import FieldWithUIOptions, UIOptions, GlobalUISchemaOpti
 
 class AuthenticateConfig(AuthActionConfiguration):
     wsdl_url: str = FieldWithUIOptions(
-        "http://www.terramarnetworks.net/v7/index.php?wsdl",
+        "https://www.terramarnetworks.net/v10/index.php?wsdl",
         title="WSDL URL",
         description=(
             "URL of the Tracpoint SOAP service WSDL. "
-            "The default points to the public Terramar Networks v7 endpoint."
+            "The default points to the public Terramar Networks v10 endpoint."
         ),
     )
     company: str = FieldWithUIOptions(

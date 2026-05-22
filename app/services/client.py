@@ -33,12 +33,18 @@ def _redact_credentials(envelope_xml: str) -> str:
     """Replace credential values in a SOAP envelope so they don't leak into logs."""
     return _CREDENTIAL_ELEMENTS_RE.sub(r"\1***REDACTED***\3", envelope_xml)
 
-# Tracpoint SOAP service — Terramar Networks v7
-# Namespace: http://www.terramarnetworks.net/v7
+# Tracpoint SOAP service — Terramar Networks v10
+# Namespace: https://www.terramarnetworks.net/v10
 # Style: RPC/encoded (SOAP 1.1)
-# Default endpoint: http://www.terramarnetworks.net/v7/index.php
+# Default endpoint: https://www.terramarnetworks.net/v10/index.php
 #
 # All operations require: userCompany, userName, userPassword in the SOAP body.
+# v10 is wire-compatible with v7 for every operation this client invokes
+# (getAllAssets, getAllPositions, getEvents, getSinglePositions). The
+# differences are: v10 namespace, v10 endpoint defaults to HTTPS,
+# Position records carry an additional `uid` field, Asset records carry
+# an additional `year` field. Per-integration `wsdl_url` overrides let
+# legacy deployments stay on v7 if needed.
 
 
 # Process-wide cache of built AsyncClients, keyed by WSDL URL. Building an
@@ -117,7 +123,7 @@ async def aclose_client_cache() -> None:
 
 class TracpointClient:
     """
-    Async SOAP client for the Tracpoint (Terramar Networks v7) web service.
+    Async SOAP client for the Tracpoint (Terramar Networks v10) web service.
 
     Credentials are passed as parameters inside every SOAP request body —
     there is no session/token. The WSDL URL is stored per-integration so

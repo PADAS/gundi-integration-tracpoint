@@ -28,7 +28,7 @@ Cursor = Tuple[datetime, Union[int, float]]
 
 def _get_client(auth_data: dict) -> TracpointClient:
     return TracpointClient(
-        wsdl_url=auth_data.get("wsdl_url", "http://www.terramarnetworks.net/v7/index.php?wsdl"),
+        wsdl_url=auth_data.get("wsdl_url", "https://www.terramarnetworks.net/v10/index.php?wsdl"),
         company=auth_data.get("company", ""),
         username=auth_data.get("username", ""),
         password=auth_data.get("password", ""),
