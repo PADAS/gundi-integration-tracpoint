@@ -42,7 +42,7 @@ cd local && docker compose up --build
 2. `app/services/action_runner.py::execute_action()` resolves the integration from Gundi, looks up the handler by `action_id`, and invokes it
 3. Action handlers live in `app/actions/handlers.py` — two are registered:
    - `action_auth` — validates SOAP creds by calling `getAllAssets`
-   - `action_pull_observations` — every 2 min via `@crontab_schedule("*/2 * * * *")`. Single `getAllPositions` call per cycle; emits Gundi observations for every fresh position and, when `PullObservationsConfig.emit_events` is True (the default), additionally emits Gundi events for positions tagged with a Tracpoint event (`eventId != 0`).
+   - `action_pull_observations` — every 2 min via `@crontab_schedule("*/2 * * * *")`. Single `getAllPositions` call per cycle; emits Gundi observations for every fresh position. Can additionally emit Gundi events for positions tagged with a Tracpoint event (`eventId != 0`) when `PullObservationsConfig.emit_events` is set to True — **default is False** because event delivery to EarthRanger requires Gundi's dispatcher-side reference-data provisioning, which is not yet deployed. Keep `emit_events=False` until that capability is in place; otherwise EarthRanger will reject the unknown event types on POST.
 4. Handlers fetch from Tracpoint via `app/services/client.py::TracpointClient`, transform with `app/services/transformers.py`, and forward via `send_observations_to_gundi` / `send_events_to_gundi`
 
 ### Tracpoint SOAP specifics (`app/services/client.py`)
@@ -77,7 +77,7 @@ Tracpoint "events" are **tags on position records** (`eventId != 0`, e.g. "Speed
 ### Action configurations (`app/actions/configurations.py`)
 
 - `AuthenticateConfig` — `wsdl_url`, `company`, `username`, `password` (`SecretStr`)
-- `PullObservationsConfig` — `subject_type`, `emit_events` (default `True`; flip off for tracking-only deployments that should not surface Tracpoint events in EarthRanger's alerts pane)
+- `PullObservationsConfig` — `subject_type`, `emit_events` (default `False`; do not flip on until Gundi's dispatcher-side reference-data provisioning is deployed, otherwise EarthRanger will reject unknown event types)
 
 Both use `FieldWithUIOptions` / `UIOptions` / `GlobalUISchemaOptions` to control how the Gundi portal renders the config forms (react-jsonschema-form ui schema).
 

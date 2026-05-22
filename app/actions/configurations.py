@@ -43,13 +43,15 @@ class PullObservationsConfig(PullActionConfiguration):
         ),
     )
     emit_events: bool = FieldWithUIOptions(
-        True,
+        False,
         title="Forward Tracpoint events to Gundi",
         description=(
             "When enabled, Tracpoint position records tagged with an event "
             "(speeding, geofence breach, panic alert, etc.) are forwarded to "
-            "Gundi as discrete events in addition to observations. Disable for "
-            "tracking-only deployments that do not need alerts in EarthRanger."
+            "Gundi as discrete events in addition to observations. "
+            "Keep disabled until Gundi's dispatcher-side reference-data "
+            "provisioning is deployed — otherwise EarthRanger will reject "
+            "unknown event types on POST and event delivery will fail."
         ),
     )
     ui_global_options = GlobalUISchemaOptions(order=["subject_type", "emit_events"])
