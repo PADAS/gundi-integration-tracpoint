@@ -1,5 +1,5 @@
-# gundi-integration-action-runner
-Template repo for integration in Gundi v2.
+# gundi-integration-tracpoint
+Gundi Action Runner for Tracpoint interface at Terramar Networks.
 
 ## Usage
 - Fork this repo
