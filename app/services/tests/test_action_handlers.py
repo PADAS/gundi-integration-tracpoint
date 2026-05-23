@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from app.actions.configurations import PullTrackHistoryConfig
 from app.actions.handlers import (
     _load_cursor_from_state,
     _parse_cursor,
@@ -171,3 +172,25 @@ def test_empty_input_returns_empty_and_preserves_cursor():
     new, new_cursor = filter_new_positions([], cursor)
     assert new == []
     assert new_cursor == cursor
+
+
+# ---------------------------------------------------------------------------
+# PullTrackHistoryConfig
+# ---------------------------------------------------------------------------
+
+def test_pull_track_history_config_has_sensible_defaults():
+    config = PullTrackHistoryConfig()
+    assert config.subject_type == "vehicle"
+    assert config.max_lookback_hours == 24
+    assert config.stale_cursor_days == 7
+
+
+def test_pull_track_history_config_accepts_overrides():
+    config = PullTrackHistoryConfig(
+        subject_type="ranger",
+        max_lookback_hours=6,
+        stale_cursor_days=3,
+    )
+    assert config.subject_type == "ranger"
+    assert config.max_lookback_hours == 6
+    assert config.stale_cursor_days == 3

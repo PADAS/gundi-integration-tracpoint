@@ -61,3 +61,35 @@ class PullObservationsConfig(PullActionConfiguration):
         ),
     )
     ui_global_options = GlobalUISchemaOptions(order=["subject_type", "emit_events"])
+
+
+class PullTrackHistoryConfig(PullActionConfiguration):
+    subject_type: str = FieldWithUIOptions(
+        "vehicle",
+        title="Subject Type",
+        description=(
+            "EarthRanger subject type applied to all observations forwarded by "
+            "the track-history backfill. Should normally match "
+            "PullObservationsConfig.subject_type."
+        ),
+    )
+    max_lookback_hours: int = FieldWithUIOptions(
+        24,
+        title="Maximum lookback (hours)",
+        description=(
+            "On a cold start, or when an asset's saved cursor is older than "
+            "stale_cursor_days, the action will not ask Tracpoint for more "
+            "than this many hours of history. Keeps the SOAP window bounded "
+            "even after long outages."
+        ),
+    )
+    stale_cursor_days: int = FieldWithUIOptions(
+        7,
+        title="Stale cursor threshold (days)",
+        description=(
+            "Saved per-asset cursors older than this are treated as cold "
+            "starts and clamped to now - max_lookback_hours. Defends against "
+            "asking Tracpoint for ranges it may have purged."
+        ),
+    )
+    ui_global_options = GlobalUISchemaOptions(order=["subject_type", "max_lookback_hours", "stale_cursor_days"])
