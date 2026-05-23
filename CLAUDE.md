@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this integration does
 
-This is the **Gundi v2 ↔ Tracpoint integration**. It pulls GPS position records from the Tracpoint (Terramar Networks v10) SOAP service and forwards them to [Gundi](https://gundiservice.org) as observations and events.
+This is the **Gundi v2 ↔ Tracpoint integration**. It pulls GPS position records from the Tracpoint (Terramar Networks v7) SOAP service and forwards them to [Gundi](https://gundiservice.org) as observations and events.
 
 The upstream `gundi-integration-action-runner` template (which this repo was forked from) supports webhook ingress with JQ transforms and dynamic schemas. **None of that applies here** — this integration is pull-driven via PubSub-triggered cron actions, not webhook-driven. `app/webhooks/handlers.py` and `app/webhooks/configurations.py` are intentionally empty.
 
@@ -50,7 +50,7 @@ cd local && docker compose up --build
 
 - WSDL-based async SOAP via `zeep.AsyncClient` (RPC/encoded, SOAP 1.1, `strict=False`)
 - **No session/token** — `userCompany`, `userName`, `userPassword` are passed in every operation's body
-- Default endpoint: `https://www.terramarnetworks.net/v10/index.php?wsdl` (overridable per integration via `AuthenticateConfig.wsdl_url`; legacy v7 endpoint is wire-compatible if a customer needs to stay on it)
+- Default endpoint: `http://www.terramarnetworks.net/v7/index.php?wsdl` (overridable per integration via `AuthenticateConfig.wsdl_url`). **Do not switch the default to v10 yet** — see "v10 known issue" below.
 - Operations used: `getAllAssets`, `getAllPositions`, `getSinglePositions(assetId, startTimestamp, endTimestamp)`, `getEvents`
 - Timestamp format Tracpoint expects/returns: `"YYYY-MM-DD HH:MM:SS"` (naive, assume UTC)
 - `_check_status()` raises `RuntimeError` on non-`OK` status. `NO_POSITION_DATA` is treated as normal (empty list), not an error.
@@ -82,6 +82,27 @@ Tracpoint "events" are **tags on position records** (`eventId != 0`, e.g. "Speed
 - `PullObservationsConfig` — `subject_type`, `emit_events` (default `False`; do not flip on until Gundi's dispatcher-side reference-data provisioning is deployed, otherwise EarthRanger will reject unknown event types)
 
 Both use `FieldWithUIOptions` / `UIOptions` / `GlobalUISchemaOptions` to control how the Gundi portal renders the config forms (react-jsonschema-form ui schema).
+
+### v10 known issue
+
+Terramar publishes a v10 WSDL alongside v7. Side-by-side the two WSDLs look wire-compatible — v10 only adds `uid` to `Position` and `year` to `Asset` on top of v7, and the operation signatures we use are identical. Based on that diff, commit `4840ed2` flipped the default `wsdl_url` to v10. **This broke production** — but not for the reasons we initially suspected.
+
+The actual failure mode (confirmed by running `local/probe_tracpoint_v10.py` against the WCS account with v7 and v10 side-by-side on 2026-05-23):
+
+- v7 `getAllPositions` returns 35 records, including fresh fixes within the last polling window. Status `OK`.
+- v10 `getAllPositions` returns **0 records** for the same credentials, same call. Status also `OK`. The response body is literally `<positions ... arrayType="tns:Position[0]"/>`.
+
+There is **no wire-format bug**: timestamps, `inboundId` types, and the rest of the Position schema are identical on v7 (we never observed v10's non-empty form). v10 simply does not surface this customer's fleet. Most likely: Terramar's web-services entitlement is configured per API version, and the WCS account is enabled for v7 web services but not v10. Authentication still succeeds (no `LOGIN_FAILED`) — the account just appears to have no assets visible on v10.
+
+Symptom in production was therefore predictable: every 2-minute cycle logged `raw_positions_fetched=0`, the cursor frozen at the last v7 fetch (`2026-05-22T17:19:27+00:00`), and no observations flowing to Gundi while the portal kept showing the fleet moving.
+
+The default is pinned back to v7 across `app/actions/configurations.py`, `app/actions/handlers.py`, and `app/services/client.py`. Before another v10 cut-over:
+
+1. Confirm with Terramar that web-services access is **explicitly enabled on the v10 endpoint** for the customer account in question (don't assume v7 entitlement carries over).
+2. Re-run `local/probe_tracpoint_v10.py` and verify v10 returns a non-empty fleet.
+3. Only then change the portal's per-integration `wsdl_url`, and watch `raw_positions_fetched` on the next 2-3 polling cycles.
+
+**Lesson:** matching WSDL diffs do not guarantee matching service behavior. The bug here wasn't in the wire shape — it was in the customer-account entitlement model on Terramar's side, which is invisible from the WSDL. Smoke-test new SOAP endpoints by actually fetching production data; `action_auth` (which only calls `getAllAssets`) is not enough on its own — that operation may return an empty list with status `OK` while v7 has a full fleet.
 
 ### Webhook path
 

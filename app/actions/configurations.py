@@ -6,11 +6,17 @@ from app.services.utils import FieldWithUIOptions, UIOptions, GlobalUISchemaOpti
 
 class AuthenticateConfig(AuthActionConfiguration):
     wsdl_url: str = FieldWithUIOptions(
-        "https://www.terramarnetworks.net/v10/index.php?wsdl",
+        "http://www.terramarnetworks.net/v7/index.php?wsdl",
         title="WSDL URL",
         description=(
             "URL of the Tracpoint SOAP service WSDL. "
-            "The default points to the public Terramar Networks v10 endpoint."
+            "Defaults to the v7 endpoint. v10 also exists upstream, but customer "
+            "accounts are entitled to web-services access per API version — for "
+            "the accounts we have tested, v10 returns zero positions while v7 "
+            "returns the full fleet. Do not switch to v10 without first "
+            "confirming with Terramar that web-services access is explicitly "
+            "enabled on v10 for the account, then re-running "
+            "local/probe_tracpoint_v10.py to verify a non-empty fleet."
         ),
     )
     company: str = FieldWithUIOptions(

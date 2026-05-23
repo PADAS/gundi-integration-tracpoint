@@ -1,6 +1,6 @@
 # gundi-integration-tracpoint
 
-Gundi v2 Action Runner for the **Tracpoint** GPS tracking service (Terramar Networks v10 SOAP).
+Gundi v2 Action Runner for the **Tracpoint** GPS tracking service (Terramar Networks v7 SOAP).
 
 Pulls GPS position records from a Tracpoint customer account on a 2-minute cadence and forwards them to [Gundi](https://gundiservice.org) as observations. Optionally forwards Tracpoint event tags (speeding, geofence breach, panic alert, etc.) as Gundi events for surfacing in EarthRanger's alerts pane.
 
@@ -17,6 +17,8 @@ For the full architecture write-up, decisions, and edge-case notes, see [`CLAUDE
 
 Tracpoint requires that web-service access be **explicitly enabled by Terramar Networks** on the customer account before SOAP calls will authenticate. Portal login alone is not sufficient. If `action_auth` returns `LOGIN_FAILED`, contact your Terramar account manager to enable web services for the account — see the vendor docs at [`docs/tracpoint_v10_web_services_1.1.docx`](./docs/tracpoint_v10_web_services_1.1.docx).
 
+> **v10 endpoint warning.** Terramar publishes a v10 WSDL alongside v7. The wire format is the same, but Terramar's web-services entitlement is configured per API version — switching a customer to v10 without first confirming v10 entitlement returns an empty fleet with SOAP status `OK`, which silently stalls the integration (cursor freezes, no observations flow). The default is pinned to v7. See [`CLAUDE.md`](./CLAUDE.md#v10-known-issue) and `local/probe_tracpoint_v10.py` before attempting a v10 cut-over again.
+
 ## Actions
 
 | Action | Trigger | Purpose |
@@ -28,7 +30,7 @@ Tracpoint requires that web-service access be **explicitly enabled by Terramar N
 
 | Field | Type | Notes |
 |---|---|---|
-| `wsdl_url` | str | Default `https://www.terramarnetworks.net/v10/index.php?wsdl`. Override if your tenant uses a different endpoint (e.g., for legacy deployments still on v7). |
+| `wsdl_url` | str | Default `http://www.terramarnetworks.net/v7/index.php?wsdl`. Override only if a tenant truly needs a different endpoint — see the v10 warning above. |
 | `company` | str | `userCompany` value — your Tracpoint company name or alias. |
 | `username` | str | `userName` — Tracpoint service-account user. |
 | `password` | `SecretStr` | `userPassword`. |
@@ -65,6 +67,8 @@ uv pip compile -o requirements.txt requirements-base.in requirements.in requirem
 ## Diagnostics
 
 Set `DEBUG_SOAP_ENVELOPES=1` to log the outbound SOAP envelope when Tracpoint returns a non-`OK` status. Credentials (`userCompany` / `userName` / `userPassword`) are redacted before logging.
+
+For diagnosing the v10 endpoint stall (see CLAUDE.md), run `python local/probe_tracpoint_v10.py` — it loads creds from a `.env*` file, calls `getAllPositions` against both v7 and v10, and prints the redacted envelopes plus the first few records side-by-side so the actual wire-shape difference can be identified.
 
 ## Project layout
 
