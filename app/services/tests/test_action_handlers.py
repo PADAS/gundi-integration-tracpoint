@@ -4,6 +4,7 @@ import pytest
 
 from app.actions.configurations import PullTrackHistoryConfig
 from app.actions.handlers import (
+    _compute_track_history_window,
     _load_cursor_from_state,
     _parse_cursor,
     _parse_position_ts,
@@ -194,3 +195,49 @@ def test_pull_track_history_config_accepts_overrides():
     assert config.subject_type == "ranger"
     assert config.max_lookback_hours == 6
     assert config.stale_cursor_days == 3
+
+
+# ---------------------------------------------------------------------------
+# _compute_track_history_window
+# ---------------------------------------------------------------------------
+
+def test_window_cold_start_uses_max_lookback():
+    """No saved cursor → fetch the full lookback window ending at now."""
+    now = datetime(2026, 5, 23, 12, 0, tzinfo=timezone.utc)
+    start, end = _compute_track_history_window(
+        cursor=None, now=now, max_lookback_hours=24, stale_cursor_days=7,
+    )
+    assert start == "2026-05-22 12:00:00"
+    assert end == "2026-05-23 12:00:00"
+
+
+def test_window_recent_cursor_used_as_start():
+    """Cursor within the stale threshold becomes the window start verbatim."""
+    now = datetime(2026, 5, 23, 12, 0, tzinfo=timezone.utc)
+    cursor = datetime(2026, 5, 23, 10, 30, tzinfo=timezone.utc)
+    start, end = _compute_track_history_window(
+        cursor=cursor, now=now, max_lookback_hours=24, stale_cursor_days=7,
+    )
+    assert start == "2026-05-23 10:30:00"
+    assert end == "2026-05-23 12:00:00"
+
+
+def test_window_stale_cursor_clamped_to_lookback():
+    """Cursor older than stale_cursor_days is treated as a cold start."""
+    now = datetime(2026, 5, 23, 12, 0, tzinfo=timezone.utc)
+    cursor = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)  # 22 days old
+    start, end = _compute_track_history_window(
+        cursor=cursor, now=now, max_lookback_hours=24, stale_cursor_days=7,
+    )
+    assert start == "2026-05-22 12:00:00"
+    assert end == "2026-05-23 12:00:00"
+
+
+def test_window_future_cursor_clamped_to_now():
+    """Defensive: a cursor in the future (clock skew?) becomes (now, now)."""
+    now = datetime(2026, 5, 23, 12, 0, tzinfo=timezone.utc)
+    cursor = datetime(2026, 5, 24, 0, 0, tzinfo=timezone.utc)
+    start, end = _compute_track_history_window(
+        cursor=cursor, now=now, max_lookback_hours=24, stale_cursor_days=7,
+    )
+    assert start == end == "2026-05-23 12:00:00"

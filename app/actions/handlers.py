@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, Tuple, Union
 
 from app.services.activity_logger import activity_logger, log_action_activity
@@ -84,6 +84,37 @@ def _cursor_for_position(pos: dict[str, Any]) -> Optional[Cursor]:
     # missing value as -1 so positions without one still sort below those with.
     inbound_val: int = inbound if isinstance(inbound, int) else -1
     return (pos_dt, inbound_val)
+
+
+def _compute_track_history_window(
+    cursor: datetime | None,
+    now: datetime,
+    max_lookback_hours: int,
+    stale_cursor_days: int,
+) -> tuple[str, str]:
+    """Pick the (start, end) range to ask `getSinglePositions` for.
+
+    The end is always `now`. The start is the saved cursor unless that
+    cursor is missing, older than `stale_cursor_days`, or in the future,
+    in which case we fall back to `now - max_lookback_hours`. The future
+    case clamps to `now` so we never send Tracpoint a backwards range.
+
+    Returns the pair as Tracpoint's wire format strings.
+    """
+    lookback_start = now - timedelta(hours=max_lookback_hours)
+    stale_before = now - timedelta(days=stale_cursor_days)
+
+    if cursor is None or cursor < stale_before:
+        start = lookback_start
+    elif cursor > now:
+        start = now
+    else:
+        start = cursor
+
+    return (
+        start.strftime(_POSITION_TS_FORMAT),
+        now.strftime(_POSITION_TS_FORMAT),
+    )
 
 
 def filter_new_positions(
