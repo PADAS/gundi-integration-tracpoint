@@ -117,6 +117,34 @@ def _compute_track_history_window(
     )
 
 
+# Used as the action_id slot in IntegrationStateManager keys. Centralized so
+# the load/save helpers and the action handler agree on the spelling and the
+# scheduler decorator below has a single source of truth.
+_TRACK_HISTORY_ACTION_ID = "pull_track_history"
+
+
+def _load_track_history_cursor(state: dict | None) -> datetime | None:
+    """Read the per-asset 'last_fetched_to' timestamp out of integration state."""
+    if not state:
+        return None
+    return _parse_cursor(state.get("last_fetched_to"))
+
+
+async def _save_track_history_cursor(
+    state_manager,
+    integration_id: str,
+    asset_id: int,
+    when: datetime,
+) -> None:
+    """Persist `when` as the new per-asset cursor for `asset_id`."""
+    await state_manager.set_state(
+        integration_id=integration_id,
+        action_id=_TRACK_HISTORY_ACTION_ID,
+        source_id=str(asset_id),
+        state={"last_fetched_to": when.isoformat()},
+    )
+
+
 def filter_new_positions(
     raw: list[dict[str, Any]],
     cursor: Optional[Cursor],

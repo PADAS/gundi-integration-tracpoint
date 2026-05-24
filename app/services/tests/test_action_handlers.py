@@ -241,3 +241,48 @@ def test_window_future_cursor_clamped_to_now():
         cursor=cursor, now=now, max_lookback_hours=24, stale_cursor_days=7,
     )
     assert start == end == "2026-05-23 12:00:00"
+
+
+# ---------------------------------------------------------------------------
+# _load_track_history_cursor
+# ---------------------------------------------------------------------------
+
+from app.actions.handlers import (
+    _load_track_history_cursor,
+    _save_track_history_cursor,
+    _TRACK_HISTORY_ACTION_ID,
+)
+
+
+def test_load_track_history_cursor_returns_none_for_empty_state():
+    assert _load_track_history_cursor(None) is None
+    assert _load_track_history_cursor({}) is None
+
+
+def test_load_track_history_cursor_parses_iso_timestamp():
+    state = {"last_fetched_to": "2026-05-21T10:00:00+00:00"}
+    assert _load_track_history_cursor(state) == datetime(2026, 5, 21, 10, 0, tzinfo=timezone.utc)
+
+
+def test_load_track_history_cursor_returns_none_on_garbage():
+    assert _load_track_history_cursor({"last_fetched_to": "not a date"}) is None
+
+
+# ---------------------------------------------------------------------------
+# _save_track_history_cursor
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_save_track_history_cursor_writes_iso_with_correct_keys(mocker):
+    state_manager = mocker.MagicMock()
+    state_manager.set_state = mocker.AsyncMock()
+    when = datetime(2026, 5, 23, 12, 0, tzinfo=timezone.utc)
+
+    await _save_track_history_cursor(state_manager, "integration-1", 42, when)
+
+    state_manager.set_state.assert_awaited_once_with(
+        integration_id="integration-1",
+        action_id=_TRACK_HISTORY_ACTION_ID,
+        source_id="42",
+        state={"last_fetched_to": "2026-05-23T12:00:00+00:00"},
+    )
