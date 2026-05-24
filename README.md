@@ -24,7 +24,8 @@ Tracpoint requires that web-service access be **explicitly enabled by Terramar N
 | Action | Trigger | Purpose |
 |---|---|---|
 | `action_auth` | On-demand | Validates SOAP credentials by calling `getAllAssets`. |
-| `action_pull_observations` | `*/2 * * * *` (every 2 min) | Fetches positions and forwards to Gundi as observations (and optionally events). |
+| `action_pull_observations` | `*/2 * * * *` (every 2 min) | Fetches the latest position per asset and forwards to Gundi as observations (and optionally events). |
+| `action_pull_track_history` | `0 */2 * * *` (every 2 hours) | Per-asset `getSinglePositions` backfill — recovers full-resolution track between hot-loop snapshots. Observations only, no events. |
 
 ### `AuthenticateConfig`
 
@@ -41,6 +42,14 @@ Tracpoint requires that web-service access be **explicitly enabled by Terramar N
 |---|---|---|---|
 | `subject_type` | str | `"vehicle"` | EarthRanger subject type applied to all observations from this integration. |
 | `emit_events` | bool | `False` | Keep off until Gundi's dispatcher-side reference-data provisioning is deployed — otherwise EarthRanger rejects unknown event types on POST. |
+
+### `PullTrackHistoryConfig`
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `subject_type` | str | `"vehicle"` | EarthRanger subject type applied to all backfilled observations — usually matches `PullObservationsConfig.subject_type`. |
+| `max_lookback_hours` | int | `24` | On cold start (or stale cursor) the window is clamped to at most this many hours, so a long outage doesn't ask Tracpoint for ranges it may have purged. |
+| `stale_cursor_days` | int | `7` | Per-asset cursors older than this are treated as cold starts. |
 
 ## Local development
 
