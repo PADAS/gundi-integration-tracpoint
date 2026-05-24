@@ -343,10 +343,18 @@ async def action_pull_track_history(integration, action_config: PullTrackHistory
         )
         raise
 
-    # 3. Per-asset fetch loop
+    # 3. Per-asset fetch loop — accumulate observations and successful asset ids.
+    #
+    # Cursor advances are intentionally deferred to step 5, after the Gundi
+    # send succeeds. If send_observations_to_gundi raises (transient outage,
+    # network blip, 5xx), no cursors move and the next 2-hour cycle re-asks
+    # for the same windows. Gundi and EarthRanger dedupe observations
+    # server-side, so the resulting overlap on retry is harmless — we prefer
+    # "fail safe and retry the window" over "advance and risk permanent loss".
     all_observations: list[dict[str, Any]] = []
     assets_with_data = 0
     asset_errors = 0
+    asset_ids_to_advance: list[int] = []
 
     for asset in assets:
         asset_id = asset.get("assetId")
@@ -378,7 +386,7 @@ async def action_pull_track_history(integration, action_config: PullTrackHistory
                 "Track-history fetch failed for asset %s on integration %s: %s",
                 asset_id, integration_id, exc,
             )
-            continue  # don't advance cursor, retry the same window next cycle
+            continue  # don't queue cursor advance — retry the same window next cycle
 
         if positions:
             assets_with_data += 1
@@ -386,19 +394,27 @@ async def action_pull_track_history(integration, action_config: PullTrackHistory
                 transform_to_observations(positions, subject_type=action_config.subject_type)
             )
 
-        # Advance the cursor even when no positions came back — otherwise a
-        # silent tracker would force us to re-ask for the same long window
-        # forever and never catch up.
-        await _save_track_history_cursor(state_manager, integration_id, asset_id, now)
+        # Queue this asset for cursor advance. The advance is written in step 5,
+        # after the send succeeds — see block comment above.
+        asset_ids_to_advance.append(asset_id)
 
-    # 4. Forward to Gundi
+    # 4. Forward to Gundi. If this raises, cursors below are never written and the
+    #    next cycle re-asks for the same windows — safe because Gundi and EarthRanger
+    #    dedupe server-side.
     if all_observations:
         await send_observations_to_gundi(
             observations=all_observations,
             integration_id=integration_id,
         )
 
-    # 5. Activity log
+    # 5. Advance cursors for assets whose fetch succeeded (with or without data).
+    #    Advancing even for silent trackers (empty fetch result) is intentional:
+    #    without it a tracker that goes quiet would pin us to an ever-growing
+    #    window and never catch up once it resumes reporting.
+    for asset_id in asset_ids_to_advance:
+        await _save_track_history_cursor(state_manager, integration_id, asset_id, now)
+
+    # 6. Activity log
     await log_action_activity(
         integration_id=integration_id,
         action_id=_TRACK_HISTORY_ACTION_ID,

@@ -180,3 +180,28 @@ async def test_cursor_advances_even_when_no_positions_returned(
     assert mocked_externals["state"].set_state.await_args.kwargs["state"] == {
         "last_fetched_to": "2026-05-23T12:00:00+00:00",
     }
+
+
+@pytest.mark.asyncio
+async def test_roster_fetch_failure_logs_and_raises(
+    fixed_now, integration, mocked_externals,
+):
+    """If fetch_assets_cached raises, log an ERROR-level activity and re-raise.
+
+    No per-asset work happens, no observations are sent, no cursors move. This
+    is the operational boundary between "transient asset-level error (swallow
+    and continue)" and "infrastructure-level error (fail loudly)".
+    """
+    mocked_externals["fetch_assets"].side_effect = RuntimeError("redis down")
+
+    with pytest.raises(RuntimeError, match="redis down"):
+        await action_pull_track_history(integration, PullTrackHistoryConfig())
+
+    mocked_externals["client"].fetch_positions_for_asset.assert_not_called()
+    mocked_externals["send"].assert_not_called()
+    mocked_externals["state"].set_state.assert_not_called()
+    mocked_externals["log"].assert_awaited_once()
+    log_kwargs = mocked_externals["log"].await_args.kwargs
+    assert log_kwargs["level"].name == "ERROR"
+    assert log_kwargs["action_id"] == "pull_track_history"
+    assert "redis down" in str(log_kwargs["data"])
