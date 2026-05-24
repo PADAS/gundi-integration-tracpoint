@@ -10,7 +10,8 @@ from app.services.client import TracpointClient
 from app.services.transformers import transform_to_observations, transform_to_events
 from gundi_core.events import LogLevel
 
-from .configurations import AuthenticateConfig, PullObservationsConfig
+from .configurations import AuthenticateConfig, PullObservationsConfig, PullTrackHistoryConfig
+from app.services.tracpoint_cache import fetch_assets_cached
 
 logger = logging.getLogger(__name__)
 
@@ -299,4 +300,125 @@ async def action_pull_observations(integration, action_config: PullObservationsC
     return {
         "observations_processed": len(observations),
         "events_processed": len(events),
+    }
+
+
+@crontab_schedule("0 */2 * * *")
+@activity_logger()
+async def action_pull_track_history(integration, action_config: PullTrackHistoryConfig):
+    """
+    Backfill full-resolution position history per asset.
+
+    Counterpart to `action_pull_observations`. Where the hot loop calls
+    `getAllPositions` once per cycle and captures only the latest fix per
+    asset, this action runs every 2 hours and calls `getSinglePositions`
+    per asset for a bounded time window, so intermediate fixes that the
+    hot loop missed are recovered for EarthRanger's track-history view.
+
+    Gundi and EarthRanger dedupe observations server-side, so overlap
+    with the hot loop is harmless and we deliberately do not filter the
+    response against any client-side "already-sent" record.
+
+    Per-asset errors are logged and swallowed so one bad asset doesn't
+    abort the cycle.
+    """
+    integration_id = str(integration.id)
+    now = datetime.now(timezone.utc)
+
+    # 1. Auth + client
+    auth_config = integration.get_action_config("auth")
+    client = _get_client(auth_config.data)
+
+    # 2. Asset roster (cached)
+    try:
+        assets = await fetch_assets_cached(client, integration_id)
+    except Exception as exc:
+        await log_action_activity(
+            integration_id=integration_id,
+            action_id=_TRACK_HISTORY_ACTION_ID,
+            level=LogLevel.ERROR,
+            title="Failed to fetch Tracpoint asset roster",
+            data={"error": str(exc)},
+            config_data=action_config.dict(),
+        )
+        raise
+
+    # 3. Per-asset fetch loop
+    all_observations: list[dict[str, Any]] = []
+    assets_with_data = 0
+    asset_errors = 0
+
+    for asset in assets:
+        asset_id = asset.get("assetId")
+        if not isinstance(asset_id, int):
+            continue
+
+        state = await state_manager.get_state(
+            integration_id=integration_id,
+            action_id=_TRACK_HISTORY_ACTION_ID,
+            source_id=str(asset_id),
+        )
+        cursor = _load_track_history_cursor(state)
+        start_ts, end_ts = _compute_track_history_window(
+            cursor=cursor,
+            now=now,
+            max_lookback_hours=action_config.max_lookback_hours,
+            stale_cursor_days=action_config.stale_cursor_days,
+        )
+
+        try:
+            positions = await client.fetch_positions_for_asset(
+                asset_id=asset_id,
+                start_timestamp=start_ts,
+                end_timestamp=end_ts,
+            )
+        except Exception as exc:
+            asset_errors += 1
+            logger.warning(
+                "Track-history fetch failed for asset %s on integration %s: %s",
+                asset_id, integration_id, exc,
+            )
+            continue  # don't advance cursor, retry the same window next cycle
+
+        if positions:
+            assets_with_data += 1
+            all_observations.extend(
+                transform_to_observations(positions, subject_type=action_config.subject_type)
+            )
+
+        # Advance the cursor even when no positions came back — otherwise a
+        # silent tracker would force us to re-ask for the same long window
+        # forever and never catch up.
+        await _save_track_history_cursor(state_manager, integration_id, asset_id, now)
+
+    # 4. Forward to Gundi
+    if all_observations:
+        await send_observations_to_gundi(
+            observations=all_observations,
+            integration_id=integration_id,
+        )
+
+    # 5. Activity log
+    await log_action_activity(
+        integration_id=integration_id,
+        action_id=_TRACK_HISTORY_ACTION_ID,
+        level=LogLevel.INFO,
+        title=(
+            f"Backfilled {len(all_observations)} observations across "
+            f"{assets_with_data}/{len(assets)} assets (errors: {asset_errors})"
+        ),
+        data={
+            "assets_processed": len(assets),
+            "assets_with_data": assets_with_data,
+            "asset_errors": asset_errors,
+            "observations_processed": len(all_observations),
+        },
+        config_data=action_config.dict(),
+    )
+
+    return {
+        "assets_processed": len(assets),
+        "assets_with_data": assets_with_data,
+        "asset_errors": asset_errors,
+        "observations_processed": len(all_observations),
     }
