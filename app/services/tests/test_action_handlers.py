@@ -2,7 +2,9 @@ from datetime import datetime, timezone
 
 import pytest
 
+from app.actions.configurations import PullTrackHistoryConfig
 from app.actions.handlers import (
+    _compute_track_history_window,
     _load_cursor_from_state,
     _parse_cursor,
     _parse_position_ts,
@@ -171,3 +173,128 @@ def test_empty_input_returns_empty_and_preserves_cursor():
     new, new_cursor = filter_new_positions([], cursor)
     assert new == []
     assert new_cursor == cursor
+
+
+# ---------------------------------------------------------------------------
+# PullTrackHistoryConfig
+# ---------------------------------------------------------------------------
+
+def test_pull_track_history_config_has_sensible_defaults():
+    config = PullTrackHistoryConfig()
+    assert config.max_lookback_hours == 24
+    assert config.stale_cursor_days == 7
+
+
+def test_pull_track_history_config_accepts_overrides():
+    config = PullTrackHistoryConfig(
+        max_lookback_hours=6,
+        stale_cursor_days=3,
+    )
+    assert config.max_lookback_hours == 6
+    assert config.stale_cursor_days == 3
+
+
+def test_pull_track_history_config_does_not_own_subject_type():
+    """subject_type is intentionally absent — the action borrows it from
+    PullObservationsConfig at runtime via _resolve_subject_type()."""
+    assert "subject_type" not in PullTrackHistoryConfig.__fields__
+
+
+def test_pull_observations_config_defaults_to_truck():
+    """Default subject_type is 'truck' — the typical Tracpoint customer
+    fleet is patrol/ranger trucks; existing integrations that have set the
+    value explicitly in the portal are unaffected."""
+    from app.actions.configurations import PullObservationsConfig
+    config = PullObservationsConfig()
+    assert config.subject_type == "truck"
+
+
+# ---------------------------------------------------------------------------
+# _compute_track_history_window
+# ---------------------------------------------------------------------------
+
+def test_window_cold_start_uses_max_lookback():
+    """No saved cursor → fetch the full lookback window ending at now."""
+    now = datetime(2026, 5, 23, 12, 0, tzinfo=timezone.utc)
+    start, end = _compute_track_history_window(
+        cursor=None, now=now, max_lookback_hours=24, stale_cursor_days=7,
+    )
+    assert start == "2026-05-22 12:00:00"
+    assert end == "2026-05-23 12:00:00"
+
+
+def test_window_recent_cursor_used_as_start():
+    """Cursor within the stale threshold becomes the window start verbatim."""
+    now = datetime(2026, 5, 23, 12, 0, tzinfo=timezone.utc)
+    cursor = datetime(2026, 5, 23, 10, 30, tzinfo=timezone.utc)
+    start, end = _compute_track_history_window(
+        cursor=cursor, now=now, max_lookback_hours=24, stale_cursor_days=7,
+    )
+    assert start == "2026-05-23 10:30:00"
+    assert end == "2026-05-23 12:00:00"
+
+
+def test_window_stale_cursor_clamped_to_lookback():
+    """Cursor older than stale_cursor_days is treated as a cold start."""
+    now = datetime(2026, 5, 23, 12, 0, tzinfo=timezone.utc)
+    cursor = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)  # 22 days old
+    start, end = _compute_track_history_window(
+        cursor=cursor, now=now, max_lookback_hours=24, stale_cursor_days=7,
+    )
+    assert start == "2026-05-22 12:00:00"
+    assert end == "2026-05-23 12:00:00"
+
+
+def test_window_future_cursor_clamped_to_now():
+    """Defensive: a cursor in the future (clock skew?) becomes (now, now)."""
+    now = datetime(2026, 5, 23, 12, 0, tzinfo=timezone.utc)
+    cursor = datetime(2026, 5, 24, 0, 0, tzinfo=timezone.utc)
+    start, end = _compute_track_history_window(
+        cursor=cursor, now=now, max_lookback_hours=24, stale_cursor_days=7,
+    )
+    assert start == end == "2026-05-23 12:00:00"
+
+
+# ---------------------------------------------------------------------------
+# _load_track_history_cursor
+# ---------------------------------------------------------------------------
+
+from app.actions.handlers import (
+    _load_track_history_cursor,
+    _save_track_history_cursor,
+    _TRACK_HISTORY_ACTION_ID,
+)
+
+
+def test_load_track_history_cursor_returns_none_for_empty_state():
+    assert _load_track_history_cursor(None) is None
+    assert _load_track_history_cursor({}) is None
+
+
+def test_load_track_history_cursor_parses_iso_timestamp():
+    state = {"last_fetched_to": "2026-05-21T10:00:00+00:00"}
+    assert _load_track_history_cursor(state) == datetime(2026, 5, 21, 10, 0, tzinfo=timezone.utc)
+
+
+def test_load_track_history_cursor_returns_none_on_garbage():
+    assert _load_track_history_cursor({"last_fetched_to": "not a date"}) is None
+
+
+# ---------------------------------------------------------------------------
+# _save_track_history_cursor
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_save_track_history_cursor_writes_iso_with_correct_keys(mocker):
+    state_manager = mocker.MagicMock()
+    state_manager.set_state = mocker.AsyncMock()
+    when = datetime(2026, 5, 23, 12, 0, tzinfo=timezone.utc)
+
+    await _save_track_history_cursor(state_manager, "integration-1", 42, when)
+
+    state_manager.set_state.assert_awaited_once_with(
+        integration_id="integration-1",
+        action_id=_TRACK_HISTORY_ACTION_ID,
+        source_id="42",
+        state={"last_fetched_to": "2026-05-23T12:00:00+00:00"},
+    )

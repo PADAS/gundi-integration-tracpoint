@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, Tuple, Union
 
 from app.services.activity_logger import activity_logger, log_action_activity
@@ -10,7 +10,8 @@ from app.services.client import TracpointClient
 from app.services.transformers import transform_to_observations, transform_to_events
 from gundi_core.events import LogLevel
 
-from .configurations import AuthenticateConfig, PullObservationsConfig
+from .configurations import AuthenticateConfig, PullObservationsConfig, PullTrackHistoryConfig
+from app.services.tracpoint_cache import fetch_assets_cached
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,82 @@ def _cursor_for_position(pos: dict[str, Any]) -> Optional[Cursor]:
     # missing value as -1 so positions without one still sort below those with.
     inbound_val: int = inbound if isinstance(inbound, int) else -1
     return (pos_dt, inbound_val)
+
+
+def _compute_track_history_window(
+    cursor: datetime | None,
+    now: datetime,
+    max_lookback_hours: int,
+    stale_cursor_days: int,
+) -> tuple[str, str]:
+    """Pick the (start, end) range to ask `getSinglePositions` for.
+
+    The end is always `now`. The start is the saved cursor unless that
+    cursor is missing, older than `stale_cursor_days`, or in the future,
+    in which case we fall back to `now - max_lookback_hours`. The future
+    case clamps to `now` so we never send Tracpoint a backwards range.
+
+    Returns the pair as Tracpoint's wire format strings.
+    """
+    lookback_start = now - timedelta(hours=max_lookback_hours)
+    stale_before = now - timedelta(days=stale_cursor_days)
+
+    if cursor is None or cursor < stale_before:
+        start = lookback_start
+    elif cursor > now:
+        start = now
+    else:
+        start = cursor
+
+    return (
+        start.strftime(_POSITION_TS_FORMAT),
+        now.strftime(_POSITION_TS_FORMAT),
+    )
+
+
+# Used as the action_id slot in IntegrationStateManager keys. Centralized so
+# the load/save helpers and the action handler agree on the spelling and the
+# scheduler decorator below has a single source of truth.
+_TRACK_HISTORY_ACTION_ID = "pull_track_history"
+
+
+def _load_track_history_cursor(state: dict | None) -> datetime | None:
+    """Read the per-asset 'last_fetched_to' timestamp out of integration state."""
+    if not state:
+        return None
+    return _parse_cursor(state.get("last_fetched_to"))
+
+
+def _resolve_subject_type(integration) -> str:
+    """Read `subject_type` from the integration's PullObservationsConfig.
+
+    The track-history action does not own its own `subject_type` setting —
+    it borrows the one from the hot-loop action so both produce observations
+    that land under the same EarthRanger subject type. If the integration
+    has no `pull_observations` action configured (unusual: the two actions
+    are designed to coexist), fall back to the same Pydantic default that
+    PullObservationsConfig declares so a misconfigured integration still
+    produces sensible observations rather than crashing.
+    """
+    pull_obs_default = PullObservationsConfig.__fields__["subject_type"].default
+    pull_obs_config = integration.get_action_config("pull_observations")
+    data = getattr(pull_obs_config, "data", None) or {}
+    return data.get("subject_type") or pull_obs_default
+
+
+async def _save_track_history_cursor(
+    state_manager,
+    integration_id: str,
+    asset_id: int,
+    when: datetime,
+) -> None:
+    """Persist `when` as the new per-asset cursor for `asset_id`."""
+    await state_manager.set_state(
+        integration_id=integration_id,
+        action_id=_TRACK_HISTORY_ACTION_ID,
+        source_id=str(asset_id),
+        state={"last_fetched_to": when.isoformat()},
+    )
 
 
 def filter_new_positions(
@@ -240,4 +317,148 @@ async def action_pull_observations(integration, action_config: PullObservationsC
     return {
         "observations_processed": len(observations),
         "events_processed": len(events),
+    }
+
+
+@crontab_schedule("0 */2 * * *")
+@activity_logger()
+async def action_pull_track_history(integration, action_config: PullTrackHistoryConfig):
+    """
+    Backfill full-resolution position history per asset.
+
+    Counterpart to `action_pull_observations`. Where the hot loop calls
+    `getAllPositions` once per cycle and captures only the latest fix per
+    asset, this action runs every 2 hours and calls `getSinglePositions`
+    per asset for a bounded time window, so intermediate fixes that the
+    hot loop missed are recovered for EarthRanger's track-history view.
+
+    Gundi and EarthRanger dedupe observations server-side, so overlap
+    with the hot loop is harmless and we deliberately do not filter the
+    response against any client-side "already-sent" record.
+
+    Per-asset errors are logged and swallowed so one bad asset doesn't
+    abort the cycle.
+    """
+    integration_id = str(integration.id)
+    now = datetime.now(timezone.utc)
+
+    # 1. Auth + client
+    auth_config = integration.get_action_config("auth")
+    client = _get_client(auth_config.data)
+
+    # 2. EarthRanger subject type comes from PullObservationsConfig — both
+    #    actions on one integration should produce the same subject_type so
+    #    observations from hot loop and backfill end up under one subject.
+    #    If pull_observations isn't configured on this integration (unusual
+    #    but not catastrophic), fall back to the same default used there.
+    subject_type = _resolve_subject_type(integration)
+
+    # 3. Asset roster (cached)
+    try:
+        assets = await fetch_assets_cached(client, integration_id)
+    except Exception as exc:
+        await log_action_activity(
+            integration_id=integration_id,
+            action_id=_TRACK_HISTORY_ACTION_ID,
+            level=LogLevel.ERROR,
+            title="Failed to fetch Tracpoint asset roster",
+            data={"error": str(exc)},
+            config_data=action_config.dict(),
+        )
+        raise
+
+    # 3. Per-asset fetch loop — accumulate observations and successful asset ids.
+    #
+    # Cursor advances are intentionally deferred to step 5, after the Gundi
+    # send succeeds. If send_observations_to_gundi raises (transient outage,
+    # network blip, 5xx), no cursors move and the next 2-hour cycle re-asks
+    # for the same windows. Gundi and EarthRanger dedupe observations
+    # server-side, so the resulting overlap on retry is harmless — we prefer
+    # "fail safe and retry the window" over "advance and risk permanent loss".
+    all_observations: list[dict[str, Any]] = []
+    assets_with_data = 0
+    asset_errors = 0
+    asset_ids_to_advance: list[int] = []
+
+    for asset in assets:
+        asset_id = asset.get("assetId")
+        if not isinstance(asset_id, int):
+            continue
+
+        state = await state_manager.get_state(
+            integration_id=integration_id,
+            action_id=_TRACK_HISTORY_ACTION_ID,
+            source_id=str(asset_id),
+        )
+        cursor = _load_track_history_cursor(state)
+        start_ts, end_ts = _compute_track_history_window(
+            cursor=cursor,
+            now=now,
+            max_lookback_hours=action_config.max_lookback_hours,
+            stale_cursor_days=action_config.stale_cursor_days,
+        )
+
+        try:
+            positions = await client.fetch_positions_for_asset(
+                asset_id=asset_id,
+                start_timestamp=start_ts,
+                end_timestamp=end_ts,
+            )
+        except Exception as exc:
+            asset_errors += 1
+            logger.warning(
+                "Track-history fetch failed for asset %s on integration %s: %s",
+                asset_id, integration_id, exc,
+            )
+            continue  # don't queue cursor advance — retry the same window next cycle
+
+        if positions:
+            assets_with_data += 1
+            all_observations.extend(
+                transform_to_observations(positions, subject_type=subject_type)
+            )
+
+        # Queue this asset for cursor advance. The advance is written in step 5,
+        # after the send succeeds — see block comment above.
+        asset_ids_to_advance.append(asset_id)
+
+    # 4. Forward to Gundi. If this raises, cursors below are never written and the
+    #    next cycle re-asks for the same windows — safe because Gundi and EarthRanger
+    #    dedupe server-side.
+    if all_observations:
+        await send_observations_to_gundi(
+            observations=all_observations,
+            integration_id=integration_id,
+        )
+
+    # 5. Advance cursors for assets whose fetch succeeded (with or without data).
+    #    Advancing even for silent trackers (empty fetch result) is intentional:
+    #    without it a tracker that goes quiet would pin us to an ever-growing
+    #    window and never catch up once it resumes reporting.
+    for asset_id in asset_ids_to_advance:
+        await _save_track_history_cursor(state_manager, integration_id, asset_id, now)
+
+    # 6. Activity log
+    await log_action_activity(
+        integration_id=integration_id,
+        action_id=_TRACK_HISTORY_ACTION_ID,
+        level=LogLevel.INFO,
+        title=(
+            f"Backfilled {len(all_observations)} observations across "
+            f"{assets_with_data}/{len(assets)} assets (errors: {asset_errors})"
+        ),
+        data={
+            "assets_processed": len(assets),
+            "assets_with_data": assets_with_data,
+            "asset_errors": asset_errors,
+            "observations_processed": len(all_observations),
+        },
+        config_data=action_config.dict(),
+    )
+
+    return {
+        "assets_processed": len(assets),
+        "assets_with_data": assets_with_data,
+        "asset_errors": asset_errors,
+        "observations_processed": len(all_observations),
     }

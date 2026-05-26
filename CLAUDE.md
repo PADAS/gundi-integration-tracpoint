@@ -41,9 +41,10 @@ cd local && docker compose up --build
 
 1. GCP PubSub delivers a message to `POST /` (`app/main.py`)
 2. `app/services/action_runner.py::execute_action()` resolves the integration from Gundi, looks up the handler by `action_id`, and invokes it
-3. Action handlers live in `app/actions/handlers.py` — two are registered:
+3. Action handlers live in `app/actions/handlers.py` — three are registered:
    - `action_auth` — validates SOAP creds by calling `getAllAssets`
    - `action_pull_observations` — every 2 min via `@crontab_schedule("*/2 * * * *")`. Single `getAllPositions` call per cycle; emits Gundi observations for every fresh position. Can additionally emit Gundi events for positions tagged with a Tracpoint event (`eventId != 0`) when `PullObservationsConfig.emit_events` is set to True — **default is False** because event delivery to EarthRanger requires Gundi's dispatcher-side reference-data provisioning, which is not yet deployed. Keep `emit_events=False` until that capability is in place; otherwise EarthRanger will reject the unknown event types on POST.
+   - `action_pull_track_history` — every 2 hours via `@crontab_schedule("0 */2 * * *")`. For each asset, calls `getSinglePositions(assetId, start, end)` over a per-asset cursor window and forwards the result as Gundi observations to recover intermediate fixes that the 2-min hot loop missed. No event emission. Per-asset cursor stored in Redis at `integration_state.{integration_id}.pull_track_history.{asset_id}`. Configurable lookback / staleness via `PullTrackHistoryConfig`.
 4. Handlers fetch from Tracpoint via `app/services/client.py::TracpointClient`, transform with `app/services/transformers.py`, and forward via `send_observations_to_gundi` / `send_events_to_gundi`
 
 ### Tracpoint SOAP specifics (`app/services/client.py`)
@@ -79,9 +80,10 @@ Tracpoint "events" are **tags on position records** (`eventId != 0`, e.g. "Speed
 ### Action configurations (`app/actions/configurations.py`)
 
 - `AuthenticateConfig` — `wsdl_url`, `company`, `username`, `password` (`SecretStr`)
-- `PullObservationsConfig` — `subject_type`, `emit_events` (default `False`; do not flip on until Gundi's dispatcher-side reference-data provisioning is deployed, otherwise EarthRanger will reject unknown event types)
+- `PullObservationsConfig` — `subject_type` (default `"truck"`), `emit_events` (default `False`; do not flip on until Gundi's dispatcher-side reference-data provisioning is deployed, otherwise EarthRanger will reject unknown event types). `subject_type` is the canonical EarthRanger subject type for the integration and is also read at runtime by `action_pull_track_history` so both actions agree.
+- `PullTrackHistoryConfig` — `max_lookback_hours` (default 24), `stale_cursor_days` (default 7). Tunes how aggressively the every-2-hour backfill clamps its time window after long outages. **No `subject_type` field on purpose** — the action borrows it from `PullObservationsConfig` via `_resolve_subject_type()` so the two actions can't drift out of sync.
 
-Both use `FieldWithUIOptions` / `UIOptions` / `GlobalUISchemaOptions` to control how the Gundi portal renders the config forms (react-jsonschema-form ui schema).
+All three use `FieldWithUIOptions` / `UIOptions` / `GlobalUISchemaOptions` to control how the Gundi portal renders the config forms (react-jsonschema-form ui schema).
 
 ### v10 known issue
 
