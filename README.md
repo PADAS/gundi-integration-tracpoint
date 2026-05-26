@@ -40,16 +40,17 @@ Tracpoint requires that web-service access be **explicitly enabled by Terramar N
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `subject_type` | str | `"vehicle"` | EarthRanger subject type applied to all observations from this integration. |
+| `subject_type` | str | `"truck"` | EarthRanger subject type applied to all observations from this integration. Also read by `action_pull_track_history` so both actions produce observations under one subject type. |
 | `emit_events` | bool | `False` | Keep off until Gundi's dispatcher-side reference-data provisioning is deployed — otherwise EarthRanger rejects unknown event types on POST. |
 
 ### `PullTrackHistoryConfig`
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `subject_type` | str | `"vehicle"` | EarthRanger subject type applied to all backfilled observations — usually matches `PullObservationsConfig.subject_type`. |
 | `max_lookback_hours` | int | `24` | On cold start (or stale cursor) the window is clamped to at most this many hours, so a long outage doesn't ask Tracpoint for ranges it may have purged. |
 | `stale_cursor_days` | int | `7` | Per-asset cursors older than this are treated as cold starts. |
+
+The track-history action does not own a `subject_type` field — it reads `PullObservationsConfig.subject_type` at runtime so the two actions stay aligned on the EarthRanger subject type.
 
 ## Local development
 

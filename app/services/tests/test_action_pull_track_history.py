@@ -19,8 +19,16 @@ def fixed_now(mocker):
 
 @pytest.fixture
 def integration(mocker):
+    """An Integration mock that returns different configs by action_id.
+
+    Two action configs are exposed: `auth` (for the SOAP client) and
+    `pull_observations` (which the track-history action reads `subject_type`
+    from). Tests that want to override per-call behavior can reassign
+    `integration.get_action_config.side_effect`.
+    """
     integration = mocker.MagicMock()
     integration.id = "integration-1"
+
     auth = mocker.MagicMock()
     auth.data = {
         "wsdl_url": "http://www.terramarnetworks.net/v7/index.php?wsdl",
@@ -28,7 +36,11 @@ def integration(mocker):
         "username": "user",
         "password": "pw",
     }
-    integration.get_action_config.return_value = auth
+    pull_obs = mocker.MagicMock()
+    pull_obs.data = {"subject_type": "truck", "emit_events": False}
+
+    configs = {"auth": auth, "pull_observations": pull_obs}
+    integration.get_action_config.side_effect = lambda action_id: configs.get(action_id)
     return integration
 
 
@@ -205,3 +217,57 @@ async def test_roster_fetch_failure_logs_and_raises(
     assert log_kwargs["level"].name == "ERROR"
     assert log_kwargs["action_id"] == "pull_track_history"
     assert "redis down" in str(log_kwargs["data"])
+
+
+@pytest.mark.asyncio
+async def test_subject_type_inherited_from_pull_observations(
+    fixed_now, integration, mocked_externals, mocker,
+):
+    """Forwarded observations use PullObservationsConfig.subject_type, not a
+    value local to PullTrackHistoryConfig — keeps the hot loop and the
+    backfill aligned under one EarthRanger subject type."""
+    # Reconfigure the integration so the pull_observations config supplies
+    # an explicit subject_type that we can recognise in the forwarded batch.
+    auth = integration.get_action_config("auth")
+    pull_obs = mocker.MagicMock()
+    pull_obs.data = {"subject_type": "ranger-truck", "emit_events": False}
+    integration.get_action_config.side_effect = (
+        lambda action_id: {"auth": auth, "pull_observations": pull_obs}.get(action_id)
+    )
+    mocked_externals["fetch_assets"].return_value = [{"assetId": 1}]
+    mocked_externals["client"].fetch_positions_for_asset.return_value = [
+        {"assetId": 1, "inboundId": 100, "timestamp": "2026-05-23 11:00:00",
+         "latitude": 1.0, "longitude": 2.0},
+    ]
+
+    await action_pull_track_history(integration, PullTrackHistoryConfig())
+
+    observations = mocked_externals["send"].await_args.kwargs["observations"]
+    assert observations[0]["subject_type"] == "ranger-truck"
+
+
+@pytest.mark.asyncio
+async def test_subject_type_falls_back_when_pull_observations_unconfigured(
+    fixed_now, integration, mocked_externals,
+):
+    """If the integration has no pull_observations action configured at all,
+    fall back to the default declared in PullObservationsConfig rather than
+    crashing or producing an unset subject_type."""
+    # Drop the pull_observations side of the lookup — only auth remains.
+    auth = integration.get_action_config("auth")
+    integration.get_action_config.side_effect = (
+        lambda action_id: auth if action_id == "auth" else None
+    )
+    mocked_externals["fetch_assets"].return_value = [{"assetId": 1}]
+    mocked_externals["client"].fetch_positions_for_asset.return_value = [
+        {"assetId": 1, "inboundId": 100, "timestamp": "2026-05-23 11:00:00",
+         "latitude": 1.0, "longitude": 2.0},
+    ]
+
+    await action_pull_track_history(integration, PullTrackHistoryConfig())
+
+    from app.actions.configurations import PullObservationsConfig
+    expected_default = PullObservationsConfig.__fields__["subject_type"].default
+
+    observations = mocked_externals["send"].await_args.kwargs["observations"]
+    assert observations[0]["subject_type"] == expected_default

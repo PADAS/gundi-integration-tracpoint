@@ -131,6 +131,23 @@ def _load_track_history_cursor(state: dict | None) -> datetime | None:
     return _parse_cursor(state.get("last_fetched_to"))
 
 
+def _resolve_subject_type(integration) -> str:
+    """Read `subject_type` from the integration's PullObservationsConfig.
+
+    The track-history action does not own its own `subject_type` setting —
+    it borrows the one from the hot-loop action so both produce observations
+    that land under the same EarthRanger subject type. If the integration
+    has no `pull_observations` action configured (unusual: the two actions
+    are designed to coexist), fall back to the same Pydantic default that
+    PullObservationsConfig declares so a misconfigured integration still
+    produces sensible observations rather than crashing.
+    """
+    pull_obs_default = PullObservationsConfig.__fields__["subject_type"].default
+    pull_obs_config = integration.get_action_config("pull_observations")
+    data = getattr(pull_obs_config, "data", None) or {}
+    return data.get("subject_type") or pull_obs_default
+
+
 async def _save_track_history_cursor(
     state_manager,
     integration_id: str,
@@ -329,7 +346,14 @@ async def action_pull_track_history(integration, action_config: PullTrackHistory
     auth_config = integration.get_action_config("auth")
     client = _get_client(auth_config.data)
 
-    # 2. Asset roster (cached)
+    # 2. EarthRanger subject type comes from PullObservationsConfig — both
+    #    actions on one integration should produce the same subject_type so
+    #    observations from hot loop and backfill end up under one subject.
+    #    If pull_observations isn't configured on this integration (unusual
+    #    but not catastrophic), fall back to the same default used there.
+    subject_type = _resolve_subject_type(integration)
+
+    # 3. Asset roster (cached)
     try:
         assets = await fetch_assets_cached(client, integration_id)
     except Exception as exc:
@@ -391,7 +415,7 @@ async def action_pull_track_history(integration, action_config: PullTrackHistory
         if positions:
             assets_with_data += 1
             all_observations.extend(
-                transform_to_observations(positions, subject_type=action_config.subject_type)
+                transform_to_observations(positions, subject_type=subject_type)
             )
 
         # Queue this asset for cursor advance. The advance is written in step 5,

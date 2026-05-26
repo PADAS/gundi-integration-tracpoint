@@ -80,8 +80,8 @@ Tracpoint "events" are **tags on position records** (`eventId != 0`, e.g. "Speed
 ### Action configurations (`app/actions/configurations.py`)
 
 - `AuthenticateConfig` — `wsdl_url`, `company`, `username`, `password` (`SecretStr`)
-- `PullObservationsConfig` — `subject_type`, `emit_events` (default `False`; do not flip on until Gundi's dispatcher-side reference-data provisioning is deployed, otherwise EarthRanger will reject unknown event types)
-- `PullTrackHistoryConfig` — `subject_type`, `max_lookback_hours` (default 24), `stale_cursor_days` (default 7). Tunes how aggressively the every-2-hour backfill clamps its time window after long outages.
+- `PullObservationsConfig` — `subject_type` (default `"truck"`), `emit_events` (default `False`; do not flip on until Gundi's dispatcher-side reference-data provisioning is deployed, otherwise EarthRanger will reject unknown event types). `subject_type` is the canonical EarthRanger subject type for the integration and is also read at runtime by `action_pull_track_history` so both actions agree.
+- `PullTrackHistoryConfig` — `max_lookback_hours` (default 24), `stale_cursor_days` (default 7). Tunes how aggressively the every-2-hour backfill clamps its time window after long outages. **No `subject_type` field on purpose** — the action borrows it from `PullObservationsConfig` via `_resolve_subject_type()` so the two actions can't drift out of sync.
 
 All three use `FieldWithUIOptions` / `UIOptions` / `GlobalUISchemaOptions` to control how the Gundi portal renders the config forms (react-jsonschema-form ui schema).
 

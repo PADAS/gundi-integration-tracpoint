@@ -41,11 +41,13 @@ class AuthenticateConfig(AuthActionConfiguration):
 
 class PullObservationsConfig(PullActionConfiguration):
     subject_type: str = FieldWithUIOptions(
-        "vehicle",
+        "truck",
         title="Subject Type",
         description=(
             "EarthRanger subject type applied to all observations from this integration. "
-            "Common values: vehicle, person, animal."
+            "Common values: truck, vehicle, person, animal. "
+            "The track-history backfill action (`action_pull_track_history`) reads this "
+            "same value, so all observations from one integration end up with one subject type."
         ),
     )
     emit_events: bool = FieldWithUIOptions(
@@ -64,15 +66,9 @@ class PullObservationsConfig(PullActionConfiguration):
 
 
 class PullTrackHistoryConfig(PullActionConfiguration):
-    subject_type: str = FieldWithUIOptions(
-        "vehicle",
-        title="Subject Type",
-        description=(
-            "EarthRanger subject type applied to all observations forwarded by "
-            "the track-history backfill. Should normally match "
-            "PullObservationsConfig.subject_type."
-        ),
-    )
+    # NOTE: subject_type is intentionally not a field here — the track-history
+    # action reads it from PullObservationsConfig at runtime so the two actions
+    # always agree on the EarthRanger subject type for one integration.
     max_lookback_hours: int = FieldWithUIOptions(
         24,
         title="Maximum lookback (hours)",
@@ -92,4 +88,4 @@ class PullTrackHistoryConfig(PullActionConfiguration):
             "asking Tracpoint for ranges it may have purged."
         ),
     )
-    ui_global_options = GlobalUISchemaOptions(order=["subject_type", "max_lookback_hours", "stale_cursor_days"])
+    ui_global_options = GlobalUISchemaOptions(order=["max_lookback_hours", "stale_cursor_days"])

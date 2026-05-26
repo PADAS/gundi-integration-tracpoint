@@ -181,20 +181,32 @@ def test_empty_input_returns_empty_and_preserves_cursor():
 
 def test_pull_track_history_config_has_sensible_defaults():
     config = PullTrackHistoryConfig()
-    assert config.subject_type == "vehicle"
     assert config.max_lookback_hours == 24
     assert config.stale_cursor_days == 7
 
 
 def test_pull_track_history_config_accepts_overrides():
     config = PullTrackHistoryConfig(
-        subject_type="ranger",
         max_lookback_hours=6,
         stale_cursor_days=3,
     )
-    assert config.subject_type == "ranger"
     assert config.max_lookback_hours == 6
     assert config.stale_cursor_days == 3
+
+
+def test_pull_track_history_config_does_not_own_subject_type():
+    """subject_type is intentionally absent — the action borrows it from
+    PullObservationsConfig at runtime via _resolve_subject_type()."""
+    assert "subject_type" not in PullTrackHistoryConfig.__fields__
+
+
+def test_pull_observations_config_defaults_to_truck():
+    """Default subject_type is 'truck' — the typical Tracpoint customer
+    fleet is patrol/ranger trucks; existing integrations that have set the
+    value explicitly in the portal are unaffected."""
+    from app.actions.configurations import PullObservationsConfig
+    config = PullObservationsConfig()
+    assert config.subject_type == "truck"
 
 
 # ---------------------------------------------------------------------------
