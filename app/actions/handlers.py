@@ -123,6 +123,18 @@ def _compute_track_history_window(
 # scheduler decorator below has a single source of truth.
 _TRACK_HISTORY_ACTION_ID = "pull_track_history"
 
+# Cap on observations per POST to Gundi's sensors API. A single track-history
+# cycle can accumulate thousands of fixes (many assets × dense history), and the
+# sensors client posts whatever it's given as one HTTP request, so we chunk here
+# to keep each request inside the API's payload/timeout limits.
+_GUNDI_OBSERVATION_BATCH_SIZE = 200
+
+
+def _batched(items: list, size: int):
+    """Yield successive `size`-length slices of `items` (size must be >= 1)."""
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
+
 
 def _load_track_history_cursor(state: dict | None) -> datetime | None:
     """Read the per-asset 'last_fetched_to' timestamp out of integration state."""
@@ -367,9 +379,9 @@ async def action_pull_track_history(integration, action_config: PullTrackHistory
         )
         raise
 
-    # 3. Per-asset fetch loop — accumulate observations and successful asset ids.
+    # 4. Per-asset fetch loop — accumulate observations and successful asset ids.
     #
-    # Cursor advances are intentionally deferred to step 5, after the Gundi
+    # Cursor advances are intentionally deferred to step 6, after the Gundi
     # send succeeds. If send_observations_to_gundi raises (transient outage,
     # network blip, 5xx), no cursors move and the next 2-hour cycle re-asks
     # for the same windows. Gundi and EarthRanger dedupe observations
@@ -418,27 +430,31 @@ async def action_pull_track_history(integration, action_config: PullTrackHistory
                 transform_to_observations(positions, subject_type=subject_type)
             )
 
-        # Queue this asset for cursor advance. The advance is written in step 5,
+        # Queue this asset for cursor advance. The advance is written in step 6,
         # after the send succeeds — see block comment above.
         asset_ids_to_advance.append(asset_id)
 
-    # 4. Forward to Gundi. If this raises, cursors below are never written and the
-    #    next cycle re-asks for the same windows — safe because Gundi and EarthRanger
-    #    dedupe server-side.
-    if all_observations:
+    # 5. Forward to Gundi in batches of at most _GUNDI_OBSERVATION_BATCH_SIZE.
+    #    The sensors client posts each batch as a single HTTP request, so
+    #    chunking bounds payload size and request time on large cycles. If any
+    #    batch raises, the exception propagates before step 6, so no cursors
+    #    advance and the next cycle re-sends every batch — harmless because
+    #    Gundi and EarthRanger dedupe server-side. (An empty observation list
+    #    yields no batches, so no request is made on a quiet cycle.)
+    for batch in _batched(all_observations, _GUNDI_OBSERVATION_BATCH_SIZE):
         await send_observations_to_gundi(
-            observations=all_observations,
+            observations=batch,
             integration_id=integration_id,
         )
 
-    # 5. Advance cursors for assets whose fetch succeeded (with or without data).
+    # 6. Advance cursors for assets whose fetch succeeded (with or without data).
     #    Advancing even for silent trackers (empty fetch result) is intentional:
     #    without it a tracker that goes quiet would pin us to an ever-growing
     #    window and never catch up once it resumes reporting.
     for asset_id in asset_ids_to_advance:
         await _save_track_history_cursor(state_manager, integration_id, asset_id, now)
 
-    # 6. Activity log
+    # 7. Activity log
     await log_action_activity(
         integration_id=integration_id,
         action_id=_TRACK_HISTORY_ACTION_ID,
