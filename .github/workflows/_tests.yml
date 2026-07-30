@@ -14,7 +14,11 @@ jobs:
       - name: Install pip
         run: python -m ensurepip --upgrade
       - name: Install pip tools
-        run: pip install pip-tools
+        # Pinned: pip-tools 7.6.0 (2026-07-18) imports typing_extensions in
+        # piptools/writer.py without declaring it as a dependency, so a clean
+        # py3.10 env crashes on `pip-compile`. Revisit once upstream ships a
+        # release that declares (or drops) the typing_extensions import.
+        run: pip install pip-tools==7.5.3
       - name: Install compile dependencies
         run: pip-compile --output-file=requirements.txt requirements-base.in requirements-dev.in requirements.in
       - name: Install dependencies
