@@ -142,6 +142,35 @@ def test_legacy_infinity_cursor_drops_everything_at_legacy_ts():
     assert new_cursor == (datetime(2026, 5, 21, 10, 1, tzinfo=timezone.utc), 1)
 
 
+def test_dropped_positions_are_logged_with_cursor_context(caplog):
+    """Diagnostic: every dropped position is logged with assetId, timestamp,
+    and inboundId plus the cursor it lost to, so production logs can show
+    whether an asset's *new* fixes are being dropped for having timestamps
+    behind the fleet-wide high-water mark (the suspected delay mechanism)."""
+    cursor = (datetime(2026, 5, 21, 10, 0, tzinfo=timezone.utc), 50)
+    raw = [
+        _pos("2026-05-21 09:58:00", asset_id=7, inbound_id=999),  # behind cursor — drop
+        _pos("2026-05-21 10:01:00", asset_id=5, inbound_id=1),    # newer — keep
+    ]
+    with caplog.at_level("INFO", logger="app.actions.handlers"):
+        filter_new_positions(raw, cursor)
+
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert "'assetId': 7" in message
+    assert "'timestamp': '2026-05-21 09:58:00'" in message
+    assert "'inboundId': 999" in message
+    assert "2026-05-21T10:00:00+00:00" in message  # the cursor it was compared to
+    assert "assetId': 5" not in message  # forwarded positions aren't logged
+
+
+def test_no_drop_log_line_when_nothing_dropped(caplog):
+    raw = [_pos("2026-05-21 10:01:00", asset_id=5, inbound_id=1)]
+    with caplog.at_level("INFO", logger="app.actions.handlers"):
+        filter_new_positions(raw, cursor=(datetime(2026, 5, 21, 10, 0, tzinfo=timezone.utc), 50))
+    assert caplog.records == []
+
+
 def test_cursor_unchanged_when_nothing_is_new():
     cursor = (datetime(2026, 5, 21, 10, 0, tzinfo=timezone.utc), 50)
     raw = [_pos("2026-05-21 09:59:00", asset_id=1, inbound_id=999)]

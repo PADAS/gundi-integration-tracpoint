@@ -188,16 +188,32 @@ def filter_new_positions(
     cause us to drop one of them. Tuples compare lexicographically in Python.
     """
     new_raw: list[dict[str, Any]] = []
+    dropped: list[dict[str, Any]] = []
     max_cursor = cursor
     for pos in raw:
         pos_cursor = _cursor_for_position(pos)
         if pos_cursor is None:
             continue
         if cursor is not None and pos_cursor <= cursor:
+            dropped.append({
+                "assetId": pos.get("assetId"),
+                "timestamp": str(pos.get("timestamp")).strip(),
+                "inboundId": pos.get("inboundId"),
+            })
             continue
         new_raw.append(pos)
         if max_cursor is None or pos_cursor > max_cursor:
             max_cursor = pos_cursor
+    if dropped:
+        # Diagnostic for reported data delays: if an asset's dropped tuple
+        # changes between cycles while staying behind the fleet-wide cursor,
+        # that asset is producing new-but-backdated fixes the hot loop is
+        # discarding (they only surface via the 2-hour backfill).
+        cursor_ts, cursor_inbound = cursor
+        logger.info(
+            "Dropped %d position(s) at/behind cursor (%s, inboundId=%s): %s",
+            len(dropped), cursor_ts.isoformat(), cursor_inbound, dropped,
+        )
     return new_raw, max_cursor
 
 
