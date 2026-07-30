@@ -2,3 +2,8 @@
 
 # SOAP client for Tracpoint web service
 zeep==4.3.2
+
+# starlette 0.27 (via fastapi 0.103) TestClient passes app= to httpx.Client,
+# which httpx 0.28 removed. Keep the pin both lockfiles have shipped with
+# until the framework template bumps fastapi/starlette.
+httpx==0.24.1
