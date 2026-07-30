@@ -164,6 +164,27 @@ def test_dropped_positions_are_logged_with_cursor_context(caplog):
     assert "assetId': 5" not in message  # forwarded positions aren't logged
 
 
+def test_drop_log_line_is_capped_for_large_fleets(caplog):
+    """The log line inlines at most _DROPPED_LOG_SAMPLE_SIZE tuples and says
+    how many were omitted, so a large fleet can't bloat or truncate the entry."""
+    from app.actions.handlers import _DROPPED_LOG_SAMPLE_SIZE
+
+    cursor = (datetime(2026, 5, 21, 10, 0, tzinfo=timezone.utc), 50)
+    total = _DROPPED_LOG_SAMPLE_SIZE + 7
+    raw = [
+        _pos("2026-05-21 09:58:00", asset_id=i, inbound_id=i)
+        for i in range(total)  # all behind cursor — all dropped
+    ]
+    with caplog.at_level("INFO", logger="app.actions.handlers"):
+        filter_new_positions(raw, cursor)
+
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert f"Dropped {total} position(s)" in message
+    assert message.count("'assetId'") == _DROPPED_LOG_SAMPLE_SIZE
+    assert "7 more omitted" in message
+
+
 def test_no_drop_log_line_when_nothing_dropped(caplog):
     raw = [_pos("2026-05-21 10:01:00", asset_id=5, inbound_id=1)]
     with caplog.at_level("INFO", logger="app.actions.handlers"):

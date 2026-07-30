@@ -20,6 +20,12 @@ state_manager = IntegrationStateManager()
 # Tracpoint position timestamp format: "YYYY-MM-DD HH:MM:SS" (naive, UTC).
 _POSITION_TS_FORMAT = "%Y-%m-%d %H:%M:%S"
 
+# Max dropped-position tuples inlined in the diagnostic log line emitted by
+# filter_new_positions. Comfortably above our current fleet sizes (~35), but
+# bounds the entry for large fleets where an unbounded list could exceed
+# Cloud Logging's per-entry size limit and get truncated.
+_DROPPED_LOG_SAMPLE_SIZE = 50
+
 # Composite cursor = (position timestamp, inboundId tie-breaker).
 # The inboundId slot may be float("+inf") for legacy state that predates the
 # tie-breaker — see `_load_cursor_from_state` — which preserves the old
@@ -208,11 +214,16 @@ def filter_new_positions(
         # Diagnostic for reported data delays: if an asset's dropped tuple
         # changes between cycles while staying behind the fleet-wide cursor,
         # that asset is producing new-but-backdated fixes the hot loop is
-        # discarding (they only surface via the 2-hour backfill).
+        # discarding (they only surface via the 2-hour backfill). Only the
+        # first _DROPPED_LOG_SAMPLE_SIZE tuples are inlined so a large fleet
+        # can't bloat the entry past Cloud Logging's per-entry size limit.
         cursor_ts, cursor_inbound = cursor
+        omitted = len(dropped) - _DROPPED_LOG_SAMPLE_SIZE
+        suffix = f" ... and {omitted} more omitted" if omitted > 0 else ""
         logger.info(
-            "Dropped %d position(s) at/behind cursor (%s, inboundId=%s): %s",
-            len(dropped), cursor_ts.isoformat(), cursor_inbound, dropped,
+            "Dropped %d position(s) at/behind cursor (%s, inboundId=%s): %s%s",
+            len(dropped), cursor_ts.isoformat(), cursor_inbound,
+            dropped[:_DROPPED_LOG_SAMPLE_SIZE], suffix,
         )
     return new_raw, max_cursor
 
