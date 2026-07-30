@@ -242,18 +242,39 @@ class ERClient:
             params["provider_key"] = provider_key
         return await self._get_all_pages("/api/v1.0/sources", params)
 
-    async def fetch_latest_observation(self, source_id: str, since: datetime) -> dict | None:
-        body = await self._get(
-            f"{self.base_url}/api/v1.0/observations",
-            params={
-                "source_id": source_id,
-                "since": since.isoformat(),
-                "ordering": "-recorded_at",
-                "page_size": 1,
-            },
-        )
-        results = (body.get("data") or {}).get("results") or []
-        return results[0] if results else None
+    async def fetch_latest_er_ts(
+        self, source_id: str, tp_ts: datetime, now: datetime,
+    ) -> datetime | None:
+        """Newest ER recorded_at for the source, without trusting server-side
+        ordering (live sites returned the OLDEST row for ordering=-recorded_at,
+        making ER look weeks stale — see PR #10 discussion).
+
+        Query 1 asks the precise question "does ER have the newest Tracpoint
+        fix (or newer)?" — a minutes-wide window for an active vehicle. Only
+        when that is empty do progressively wider lookbacks quantify how far
+        behind ER actually is.
+        """
+        async def window_max(since: datetime, until: datetime) -> datetime | None:
+            obs = await self._get_all_pages(
+                "/api/v1.0/observations",
+                {
+                    "source_id": source_id,
+                    "since": since.isoformat(),
+                    "until": until.isoformat(),
+                    "page_size": 4000,
+                },
+            )
+            stamps = [t for o in obs if (t := _parse_er_ts(o.get("recorded_at")))]
+            return max(stamps) if stamps else None
+
+        latest = await window_max(tp_ts - timedelta(minutes=1), now)
+        if latest is not None:
+            return latest
+        for lookback in (timedelta(hours=2), timedelta(hours=26), timedelta(days=7)):
+            latest = await window_max(now - lookback, now)
+            if latest is not None:
+                return latest
+        return None
 
     async def fetch_observations_window(
         self, source_id: str, since: datetime, until: datetime,
@@ -293,6 +314,11 @@ async def build_source_map(
     return mapping
 
 
+# The pull_track_history backfill runs every 2 hours, so a healthy pipeline
+# never leaves ER more than one backfill cycle behind the Tracpoint API.
+_BACKFILL_ALLOWANCE = timedelta(hours=2)
+
+
 def er_verdict(
     tp_ts: datetime,
     er_ts: datetime | None,
@@ -305,12 +331,16 @@ def er_verdict(
     (None if ER has nothing in the lookback window).
     """
     if er_ts is not None:
-        behind_s = (tp_ts - er_ts).total_seconds()
-        if behind_s < -_MATCH_SLACK_S:
+        behind = tp_ts - er_ts
+        if behind.total_seconds() < -_MATCH_SLACK_S:
             return "TP-REGRESSED"  # ER ahead of the API: v7 served stale data
-        if behind_s <= _MATCH_SLACK_S:
+        if behind.total_seconds() <= _MATCH_SLACK_S:
             return "OK"
-    # ER is behind the Tracpoint API. In flight, or actually stuck?
+        if behind > _BACKFILL_ALLOWANCE + tolerance:
+            # ER is more than a full backfill cycle behind — the pipeline is
+            # stuck for this vehicle even if its newest fix is still in flight.
+            return "LAGGING"
+    # ER is somewhat behind the Tracpoint API. In flight, or actually stuck?
     if (now - tp_ts) <= tolerance:
         return "PENDING"
     return "LAGGING"
@@ -436,8 +466,6 @@ async def _compare_fleet_against_er(
     """One comparison cycle: {assetId: {verdict, er_ts, tp_ts, tp_inbound}}."""
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=max_age_days) if max_age_days > 0 else None
-    lookback = now - timedelta(days=7)  # bounds the ER query; older fleets are hidden anyway
-
     results: dict = {}
     for pos in positions:
         tp_ts = _parse_ts(pos.get("timestamp"))
@@ -449,8 +477,7 @@ async def _compare_fleet_against_er(
             results[asset_id] = {"verdict": "NO-MATCH", "er_ts": None,
                                  "tp_ts": tp_ts, "tp_inbound": pos.get("inboundId")}
             continue
-        obs = await er.fetch_latest_observation(source_id, since=min(lookback, tp_ts - timedelta(minutes=1)))
-        er_ts = _parse_er_ts(obs.get("recorded_at")) if obs else None
+        er_ts = await er.fetch_latest_er_ts(source_id, tp_ts, now)
         results[asset_id] = {
             "verdict": er_verdict(tp_ts, er_ts, now, tolerance),
             "er_ts": er_ts,
