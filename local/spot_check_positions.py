@@ -624,7 +624,12 @@ async def _run(args, creds: dict) -> None:
                     print(f"\nER fetch failed (continuing without ER this cycle): {exc!r}")
             previous = _print_fleet_table(positions, args.max_age_days, previous, er_results)
             if er_results and args.log:
-                _append_jsonl(args.log, er_results)
+                try:
+                    _append_jsonl(args.log, er_results)
+                except OSError as exc:
+                    # A transient disk/permission problem must not kill an
+                    # unattended overnight watch; the table output continues.
+                    print(f"\nFailed to append to {args.log} (continuing): {exc}")
             if not args.watch:
                 return
             await asyncio.sleep(args.watch)
