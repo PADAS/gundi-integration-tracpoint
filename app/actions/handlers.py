@@ -234,6 +234,7 @@ def filter_new_positions(
                 "timestamp": str(pos.get("timestamp")).strip(),
                 "inboundId": pos.get("inboundId"),
                 "cursor_ts": own_cursor[0].isoformat(),
+                "cursor_inbound_id": own_cursor[1],
             })
             continue
         new_raw.append(pos)

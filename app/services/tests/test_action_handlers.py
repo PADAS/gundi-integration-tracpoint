@@ -238,6 +238,7 @@ def test_dropped_positions_are_logged_with_their_assets_cursor(caplog):
     assert "'timestamp': '2026-05-21 09:58:00'" in message
     assert "'inboundId': 999" in message
     assert "'cursor_ts': '2026-05-21T10:00:00+00:00'" in message  # this asset's own cursor
+    assert "'cursor_inbound_id': 50" in message  # full composite cursor: same-second drops stay debuggable
     assert "assetId': 5" not in message  # forwarded positions aren't logged
 
 
