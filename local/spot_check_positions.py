@@ -202,10 +202,12 @@ class ERClient:
 
     def __init__(self, base_url: str, token: str, timeout: float = 30.0):
         self.base_url = base_url.rstrip("/")
+        # No follow_redirects: this client sends a bearer token, and a
+        # redirect could forward it to an unexpected host. ER API URLs
+        # don't redirect; a wrong base URL should fail loudly instead.
         self._client = httpx.AsyncClient(
             timeout=timeout,
             headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-            follow_redirects=True,
         )
 
     async def aclose(self) -> None:
@@ -360,7 +362,7 @@ def diff_tracks(
     ER-only observations.
     """
     er_by_inbound: dict[int, dict] = {}
-    er_by_ts: dict[int, dict] = {}  # epoch-second buckets for slack matching
+    er_by_ts: dict[int, list[dict]] = {}  # epoch-second buckets for slack matching
     for obs in er_observations:
         ts = _parse_er_ts(obs.get("recorded_at"))
         if ts is None:
@@ -369,7 +371,7 @@ def diff_tracks(
         inbound = details.get("inbound_id")
         if isinstance(inbound, int):
             er_by_inbound[inbound] = obs
-        er_by_ts[int(ts.timestamp())] = obs
+        er_by_ts.setdefault(int(ts.timestamp()), []).append(obs)
 
     matched, candidate_drops, in_flight = [], [], []
     claimed: set[int] = set()
@@ -380,10 +382,18 @@ def diff_tracks(
         inbound = pos.get("inboundId")
         obs = er_by_inbound.get(inbound) if isinstance(inbound, int) else None
         if obs is None:
+            # Timestamp fallback: each ER observation may satisfy only one
+            # Tracpoint fix — two fixes in the same second must not both
+            # match the same observation (that would hide a real drop).
             epoch = int(ts.timestamp())
             for probe in range(-_MATCH_SLACK_S, _MATCH_SLACK_S + 1):
-                if (hit := er_by_ts.get(epoch + probe)) is not None:
-                    obs = hit
+                bucket = er_by_ts.get(epoch + probe)
+                if bucket:
+                    for i, candidate in enumerate(bucket):
+                        if id(candidate) not in claimed:
+                            obs = bucket.pop(i)
+                            break
+                if obs is not None:
                     break
         if obs is not None:
             claimed.add(id(obs))
