@@ -99,7 +99,6 @@ import json
 import logging
 import os
 import sys
-import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -597,7 +596,7 @@ async def _run(args, creds: dict) -> None:
                 # Watch mode must survive unattended overnight runs: log,
                 # wait out the interval, try again next cycle.
                 print(f"\nTracpoint fetch failed (retrying in {args.watch}s): {exc!r}")
-                time.sleep(args.watch)
+                await asyncio.sleep(args.watch)
                 continue
             er_results = None
             if er is not None:
@@ -618,7 +617,7 @@ async def _run(args, creds: dict) -> None:
                 _append_jsonl(args.log, er_results)
             if not args.watch:
                 return
-            time.sleep(args.watch)
+            await asyncio.sleep(args.watch)
     finally:
         if er is not None:
             await er.aclose()
