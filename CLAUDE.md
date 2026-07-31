@@ -29,8 +29,8 @@ uvicorn app.main:app --reload --port 8080
 # Full local stack (FastAPI + Redis + PubSub emulator)
 cd local && docker compose up --build
 # API docs:  http://localhost:8080/docs
-# (The optional web-ui service is commented out in local/docker-compose.yml;
-#  re-enable it there if you want the React UI on http://localhost:3000.)
+# (The optional web-ui service is behind a compose profile; add
+#  `--profile web-ui` to the up command for the React UI on http://localhost:3000.)
 ```
 
 `local/.env.local` is a symlink to `.env.stage` (points the local stack at stage Gundi). `.env.production` exists for prod-config testing. Set `KEYCLOAK_CLIENT_SECRET` before first run — get it from the Gundi team.
