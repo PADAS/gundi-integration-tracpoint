@@ -84,6 +84,14 @@ def test_load_asset_cursors_ignores_legacy_fleet_cursor_state():
     assert _load_asset_cursors_from_state(state) == {}
 
 
+def test_load_asset_cursors_tolerates_non_dict_container():
+    """A malformed container (list/string/int where the map should be) must
+    not crash the pull loop — it reads as 'no cursors', same as empty state."""
+    assert _load_asset_cursors_from_state({"asset_cursors": ["not", "a", "dict"]}) == {}
+    assert _load_asset_cursors_from_state({"asset_cursors": "garbage"}) == {}
+    assert _load_asset_cursors_from_state({"asset_cursors": 42}) == {}
+
+
 def test_load_asset_cursors_skips_malformed_entries():
     state = {"asset_cursors": {
         "4980958": ["2026-07-31T11:48:13+00:00", 6119224424],

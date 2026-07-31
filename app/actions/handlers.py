@@ -77,8 +77,11 @@ def _load_asset_cursors_from_state(state: dict | None) -> dict[int, Cursor]:
     """
     if not state:
         return {}
+    raw_cursors = state.get("asset_cursors")
+    if not isinstance(raw_cursors, dict):
+        return {}
     cursors: dict[int, Cursor] = {}
-    for key, value in (state.get("asset_cursors") or {}).items():
+    for key, value in raw_cursors.items():
         if not (isinstance(key, str) and key.lstrip("-").isdigit()):
             continue
         if not (isinstance(value, (list, tuple)) and len(value) == 2):
