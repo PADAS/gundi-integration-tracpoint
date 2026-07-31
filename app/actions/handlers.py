@@ -20,10 +20,19 @@ state_manager = IntegrationStateManager()
 # Tracpoint position timestamp format: "YYYY-MM-DD HH:MM:SS" (naive, UTC).
 _POSITION_TS_FORMAT = "%Y-%m-%d %H:%M:%S"
 
+# Max dropped-position tuples inlined in the diagnostic log line emitted by
+# filter_new_positions. Comfortably above our current fleet sizes (~35), but
+# bounds the entry for large fleets where an unbounded list could exceed
+# Cloud Logging's per-entry size limit and get truncated.
+_DROPPED_LOG_SAMPLE_SIZE = 50
+
 # Composite cursor = (position timestamp, inboundId tie-breaker).
-# The inboundId slot may be float("+inf") for legacy state that predates the
-# tie-breaker — see `_load_cursor_from_state` — which preserves the old
-# drop-on-equality dedup behavior until the cursor advances.
+# Dedup is PER ASSET (GUNDI-5543): each vehicle is compared only against its
+# own last-forwarded tuple. The previous fleet-wide high-water mark silently
+# discarded fixes that surfaced in getAllPositions late (Terramar ingests
+# fixes 10-56 min after their GPS timestamps) whenever any other vehicle had
+# already pushed the fleet max past them — freezing those vehicles in
+# EarthRanger until the 2-hour backfill.
 Cursor = Tuple[datetime, Union[int, float]]
 
 
@@ -56,23 +65,43 @@ def _parse_position_ts(raw: Any) -> datetime | None:
         return None
 
 
-def _load_cursor_from_state(state: dict | None) -> Optional[Cursor]:
-    """Read the persisted high-water mark, handling pre-tie-breaker state.
+def _load_asset_cursors_from_state(state: dict | None) -> dict[int, Cursor]:
+    """Read the per-asset high-water marks out of integration state.
 
-    Modern state has both `last_cursor` (ISO timestamp) and `last_cursor_inbound_id`.
-    Legacy state from before the tie-breaker has only `last_cursor`; in that
-    case we use +inf for the inboundId slot so the legacy drop-on-equality
-    semantics are preserved until the cursor advances to a newer timestamp.
+    State written by fleet-wide-cursor deployments (only `last_cursor` /
+    `last_cursor_inbound_id`) is deliberately ignored: the first post-deploy
+    cycle re-forwards each asset's latest position once, and Gundi/ER dedupe
+    server-side. Seeding every asset from the fleet max instead would re-drop
+    any fix that was late-surfacing at the moment of migration — the very
+    bug the per-asset cursor exists to fix. Malformed entries are skipped.
     """
     if not state:
-        return None
-    ts = _parse_cursor(state.get("last_cursor"))
-    if ts is None:
-        return None
-    inbound = state.get("last_cursor_inbound_id")
-    if isinstance(inbound, int):
-        return (ts, inbound)
-    return (ts, float("inf"))
+        return {}
+    raw_cursors = state.get("asset_cursors")
+    if not isinstance(raw_cursors, dict):
+        return {}
+    cursors: dict[int, Cursor] = {}
+    for key, value in raw_cursors.items():
+        if not (isinstance(key, str) and key.lstrip("-").isdigit()):
+            continue
+        if not (isinstance(value, (list, tuple)) and len(value) == 2):
+            continue
+        ts = _parse_cursor(value[0])
+        if ts is None or not isinstance(value[1], int):
+            continue
+        cursors[int(key)] = (ts, value[1])
+    return cursors
+
+
+def _serialize_asset_cursors(cursors: dict[int, Cursor]) -> dict[str, list]:
+    """JSON-safe form of the per-asset cursors: {"<assetId>": [iso_ts, inboundId]}."""
+    return {str(asset_id): [ts.isoformat(), inbound] for asset_id, (ts, inbound) in cursors.items()}
+
+
+def _fleet_max_cursor(cursors: dict[int, Cursor]) -> Optional[Cursor]:
+    """Max tuple across all assets — written alongside the per-asset map so a
+    rollback to a fleet-wide-cursor build resumes from sane state."""
+    return max(cursors.values()) if cursors else None
 
 
 def _cursor_for_position(pos: dict[str, Any]) -> Optional[Cursor]:
@@ -177,28 +206,52 @@ async def _save_track_history_cursor(
 
 def filter_new_positions(
     raw: list[dict[str, Any]],
-    cursor: Optional[Cursor],
-) -> tuple[list[dict[str, Any]], Optional[Cursor]]:
-    """Return positions strictly newer than `cursor` plus the new high-water mark.
+    asset_cursors: dict[int, Cursor],
+) -> tuple[list[dict[str, Any]], dict[int, Cursor]]:
+    """Return positions newer than their asset's own cursor, plus updated cursors.
 
     `getAllPositions` returns the latest known position for every asset on
     every call, including assets that haven't reported since the last cycle.
-    The cursor is a `(timestamp, inboundId)` tuple — using the inboundId as a
-    tie-breaker means two assets reporting at the exact same second don't
-    cause us to drop one of them. Tuples compare lexicographically in Python.
+    Each position is compared against its OWN asset's `(timestamp, inboundId)`
+    tuple only (tuples compare lexicographically; the inboundId breaks
+    same-second ties). A fix that surfaces in the API late is therefore still
+    forwarded — under the old fleet-wide cursor it was silently dropped
+    whenever any other vehicle had already advanced the fleet max past it
+    (GUNDI-5543). Cursors for assets absent from `raw` are retained.
     """
     new_raw: list[dict[str, Any]] = []
-    max_cursor = cursor
+    dropped: list[dict[str, Any]] = []
+    updated = dict(asset_cursors)
     for pos in raw:
         pos_cursor = _cursor_for_position(pos)
-        if pos_cursor is None:
+        asset_id = pos.get("assetId")
+        if pos_cursor is None or asset_id is None:
             continue
-        if cursor is not None and pos_cursor <= cursor:
+        own_cursor = updated.get(asset_id)
+        if own_cursor is not None and pos_cursor <= own_cursor:
+            dropped.append({
+                "assetId": asset_id,
+                "timestamp": str(pos.get("timestamp")).strip(),
+                "inboundId": pos.get("inboundId"),
+                "cursor_ts": own_cursor[0].isoformat(),
+                "cursor_inbound_id": own_cursor[1],
+            })
             continue
         new_raw.append(pos)
-        if max_cursor is None or pos_cursor > max_cursor:
-            max_cursor = pos_cursor
-    return new_raw, max_cursor
+        updated[asset_id] = pos_cursor
+    if dropped:
+        # With per-asset cursors a drop only means "this asset re-reported an
+        # already-forwarded fix (or went backwards)" — normal, but kept in the
+        # logs for observability. Only the first _DROPPED_LOG_SAMPLE_SIZE
+        # tuples are inlined so a large fleet can't bloat the entry past
+        # Cloud Logging's per-entry size limit.
+        omitted = len(dropped) - _DROPPED_LOG_SAMPLE_SIZE
+        suffix = f" ... and {omitted} more omitted" if omitted > 0 else ""
+        logger.info(
+            "Dropped %d position(s) at/behind their asset's own cursor: %s%s",
+            len(dropped), dropped[:_DROPPED_LOG_SAMPLE_SIZE], suffix,
+        )
+    return new_raw, updated
 
 
 @activity_logger()
@@ -234,9 +287,10 @@ async def action_pull_observations(integration, action_config: PullObservationsC
 
     Every cycle calls `getAllPositions` exactly once — a single SOAP call
     regardless of fleet size. Tracpoint returns the latest known position for
-    every asset; we dedup client-side against the previous cycle's high-water
-    mark stored in Redis, so an asset that has not reported new data is
-    silently filtered out.
+    every asset; we dedup client-side against PER-ASSET high-water marks
+    stored in Redis, so an asset that has not reported new data is silently
+    filtered out while a fix that surfaces in the API late (Terramar ingest
+    lag, GUNDI-5543) is still forwarded promptly.
 
     Each forwarded position becomes a Gundi observation. Positions tagged with
     a Tracpoint event (eventId != 0 — speeding, geofence breach, panic alert,
@@ -257,12 +311,12 @@ async def action_pull_observations(integration, action_config: PullObservationsC
     auth_config = integration.get_action_config("auth")
     client = _get_client(auth_config.data)
 
-    # 2. Persisted high-water mark
+    # 2. Persisted per-asset high-water marks
     state = await state_manager.get_state(
         integration_id=integration_id,
         action_id="pull_observations",
     )
-    since = _load_cursor_from_state(state)
+    asset_cursors = _load_asset_cursors_from_state(state)
 
     # 3. Single fetch
     try:
@@ -278,8 +332,8 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         )
         raise
 
-    # 4. Filter to positions newer than the cursor; track the new high-water mark
-    new_raw, new_cursor = filter_new_positions(raw, since)
+    # 4. Filter to positions newer than each asset's own cursor
+    new_raw, updated_cursors = filter_new_positions(raw, asset_cursors)
 
     # 5. Transform — every fresh position is an observation; tagged positions are also events
     observations = transform_to_observations(new_raw, subject_type=action_config.subject_type)
@@ -297,17 +351,20 @@ async def action_pull_observations(integration, action_config: PullObservationsC
             integration_id=integration_id,
         )
 
-    # 7. Advance cursor only when we actually forwarded something. new_cursor
-    #    will always have a concrete int inbound_id at this point (any legacy
-    #    +inf sentinel sits in `since`, never in the max derived from new_raw).
-    if new_raw and new_cursor is not None:
-        new_ts, new_inbound = new_cursor
+    # 7. Persist cursors only when we actually forwarded something (the map
+    #    can only have changed in that case). The legacy fleet-max fields are
+    #    written alongside the per-asset map so a rollback to a fleet-wide-
+    #    cursor build resumes from sane state instead of a frozen cursor.
+    if new_raw:
+        fleet_max = _fleet_max_cursor(updated_cursors)
+        max_ts, max_inbound = fleet_max
         await state_manager.set_state(
             integration_id=integration_id,
             action_id="pull_observations",
             state={
-                "last_cursor": new_ts.isoformat(),
-                "last_cursor_inbound_id": new_inbound,
+                "asset_cursors": _serialize_asset_cursors(updated_cursors),
+                "last_cursor": max_ts.isoformat(),
+                "last_cursor_inbound_id": max_inbound,
             },
         )
 
