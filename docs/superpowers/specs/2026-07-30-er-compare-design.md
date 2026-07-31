@@ -51,10 +51,15 @@ and can be affected by ER-side subject configuration).
 
 ### Fleet watch cycle (default table, `--watch`)
 
-Per cycle: one `getAllPositions` call + one latest-observation lookup per
-matched source (`GET /api/v1.0/observations?source_id=<uuid>` newest-first,
-page size 1 — ~16 live sources, trivial at 60 s cadence; exact query params
-verified against the live API on first run).
+Per cycle: one `getAllPositions` call + a latest-observation lookup per
+matched source. The lookup does NOT trust server-side ordering — the live
+site returned the *oldest* row in the window for
+`ordering=-recorded_at&page_size=1` (see PR #10 discussion), so
+`ERClient.fetch_latest_er_ts()` queries a time window and takes
+`max(recorded_at)` client-side: first a minutes-wide window answering
+"does ER have the newest Tracpoint fix (or newer)?", then progressively
+wider lookbacks (2 h / 26 h / 7 d) only when that is empty. ~16 live
+sources, trivial at 60 s cadence.
 
 Per vehicle verdict, with `--tolerance-min` (default 10) allowing for
 Gundi pipeline latency:

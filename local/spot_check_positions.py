@@ -589,7 +589,16 @@ async def _run(args, creds: dict) -> None:
         source_map: dict[int, str] = {}
         previous: dict | None = None
         while True:
-            positions = await client.fetch_all_positions()
+            try:
+                positions = await client.fetch_all_positions()
+            except Exception as exc:
+                if not args.watch:
+                    raise  # one-shot mode should fail loudly
+                # Watch mode must survive unattended overnight runs: log,
+                # wait out the interval, try again next cycle.
+                print(f"\nTracpoint fetch failed (retrying in {args.watch}s): {exc!r}")
+                time.sleep(args.watch)
+                continue
             er_results = None
             if er is not None:
                 try:
