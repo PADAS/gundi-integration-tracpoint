@@ -80,6 +80,10 @@ Set `DEBUG_SOAP_ENVELOPES=1` to log the outbound SOAP envelope when Tracpoint re
 
 For diagnosing the v10 endpoint stall (see CLAUDE.md), run `python local/probe_tracpoint_v10.py` — it loads creds from a `.env*` file, calls `getAllPositions` against both v7 and v10, and prints the redacted envelopes plus the first few records side-by-side so the actual wire-shape difference can be identified.
 
+## Activity-log redaction
+
+The configuration attached to every activity-log event is redacted before publishing (`app/services/redaction.py`): values under secret-looking keys (`password`, `token`, `api_key`, `secret`, ...) and fields a config model declares as `SecretStr`, `Field(format="password")` or `UIOptions(widget="password")` are replaced with `**********`, matched by field name or alias and at any depth of nested models. `AuthenticateConfig.password` is a `SecretStr`, so it never reaches the portal's activity log in clear.
+
 ## Project layout
 
 ```
